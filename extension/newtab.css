@@ -416,6 +416,10 @@ body {
   padding: 1rem 1.5rem;
 }
 
+.bookmarks-grid > * {
+  min-width: 0;
+}
+
 @media (min-width: 768px) {
   .bookmarks-grid {
     padding: 1.5rem 2rem;
@@ -445,6 +449,8 @@ body {
   align-items: center;
   justify-content: center;
   aspect-ratio: 4 / 3;
+  min-width: 0;
+  overflow: hidden;
   border-radius: var(--radius-lg);
   cursor: pointer;
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -532,10 +538,18 @@ body {
 .bm-card__body {
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: stretch;
   gap: 0.5rem;
+  width: 100%;
+  min-width: 0;
   padding: 1rem;
+  box-sizing: border-box;
   text-align: center;
+}
+
+.bm-card__body > .bm-card__img,
+.bm-card__body > .bm-card__letter {
+  align-self: center;
 }
 
 .bm-card__img {
@@ -567,24 +581,32 @@ body {
 }
 
 .bm-card__title {
+  display: block;
   font-size: 0.875rem;
   font-weight: 500;
   line-height: 1.25;
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0 0.5rem;
+  box-sizing: border-box;
 }
 
 .bm-card__desc {
+  display: block;
   font-size: 0.75rem;
   opacity: 0.7;
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0 0.5rem;
+  box-sizing: border-box;
 }
 
 /* Add card */
@@ -1181,14 +1203,35 @@ body {
 .bm-preview {
   aspect-ratio: 4 / 3;
   max-width: 120px;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
   border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: stretch;
   justify-content: center;
   gap: 0.5rem;
   padding: 0.75rem;
+  box-sizing: border-box;
   transition: background 0.2s;
+}
+
+.bm-preview > .bm-preview-favicon {
+  align-self: center;
+}
+
+.bm-preview__title {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  box-sizing: border-box;
 }
 
 .modal-actions {
@@ -1296,6 +1339,15 @@ body {
   color: #71717a;
   text-align: center;
   margin: 0.5rem 0 0;
+}
+
+.auth-note a {
+  color: #60a5fa;
+  text-decoration: underline;
+}
+
+.auth-note a:hover {
+  color: #93c5fd;
 }
 
 /* Settings sections (light modal) */

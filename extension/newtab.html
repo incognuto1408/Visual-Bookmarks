@@ -130,9 +130,9 @@
           <h2 id="bookmarkModalTitle" class="modal-title">Добавить закладку</h2>
           <button type="button" class="modal-close modal-close--dark" data-close="modalBookmark" aria-label="Закрыть">&times;</button>
         </div>
-        <form id="formBookmark" class="modal-body modal-body--dark">
-          <label class="form-field"><span class="form-label">Название</span><input type="text" id="bmTitle" class="form-input form-input--dark" required placeholder="Google" /></label>
-          <label class="form-field"><span class="form-label">URL</span><input type="text" id="bmUrl" class="form-input form-input--dark" required placeholder="https://google.com" /></label>
+        <form id="formBookmark" class="modal-body modal-body--dark" novalidate>
+          <label class="form-field"><span class="form-label">Название</span><input type="text" id="bmTitle" class="form-input form-input--dark" autocomplete="off" placeholder="Google" /></label>
+          <label class="form-field"><span class="form-label">URL</span><input type="text" id="bmUrl" class="form-input form-input--dark" autocomplete="off" placeholder="https://google.com" /></label>
           <label class="form-field"><span class="form-label">Описание (необязательно)</span><input type="text" id="bmDesc" class="form-input form-input--dark" placeholder="Поисковая система" /></label>
           <div class="form-field">
             <div class="color-row">
@@ -189,7 +189,7 @@
           <label class="form-field"><span class="form-label">Email</span><input type="email" id="authEmail" class="form-input form-input--dark" required placeholder="example@mail.com" /></label>
           <label class="form-field"><span class="form-label">Пароль</span><input type="password" id="authPassword" class="form-input form-input--dark" required placeholder="••••••••" /></label>
           <button type="submit" class="btn btn--primary btn--block" id="authSubmit">Войти</button>
-          <p class="auth-note">Вход и регистрация идут на ваш API (URL в Настройки → Система). Без URL — только локальный демо-профиль.</p>
+          <p class="auth-note">Вход и регистрация выполняются через сервис Crypt-Chain (фиксированный адрес API). Информация о входе на сайте: <a href="https://crypt-chain.com/browser-extension/login" target="_blank" rel="noopener noreferrer">crypt-chain.com/browser-extension/login</a>.</p>
         </form>
       </div>
     </div>

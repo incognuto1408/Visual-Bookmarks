@@ -1,8 +1,11 @@
 /**
- * Клиент вашего бэкенда: регистрация, вход, синхронизация состояния.
+ * Клиент бэкенда Crypt-Chain: регистрация, вход, синхронизация состояния.
  * Контракт API описан в SERVER_API.md
  */
 (function (global) {
+  const API_BASE = 'https://crypt-chain.com/browser-extension';
+  const LOGIN_PAGE_URL = 'https://crypt-chain.com/browser-extension/login';
+
   const K = {
     TOKEN: 'vb_server_access_token',
     USER: 'vb_server_user_json',
@@ -53,18 +56,17 @@
   }
 
   async function getServerUrl() {
-    const x = await storageGet([K.BASE]);
-    return String(x[K.BASE] || '')
-      .trim()
-      .replace(/\/$/, '');
+    return API_BASE;
   }
 
-  async function setServerUrl(url) {
-    const u = String(url || '')
-      .trim()
-      .replace(/\/$/, '');
-    await storageSet({ [K.BASE]: u });
-    return u;
+  function getLoginPageUrl() {
+    return LOGIN_PAGE_URL;
+  }
+
+  /** Ранее сохранённый пользовательский URL больше не используется; очищаем при сохранении настроек. */
+  async function setServerUrl() {
+    await storageRemove([K.BASE]);
+    return API_BASE;
   }
 
   async function getAccessToken() {
@@ -120,6 +122,10 @@
     let msg = res.statusText || 'Ошибка ' + res.status;
     try {
       const j = await res.json();
+      if (j.status === false && j.data) {
+        if (typeof j.data === 'string') msg = j.data;
+        else if (j.data && typeof j.data === 'object' && j.data.message) msg = String(j.data.message);
+      }
       if (j.message) msg = j.message;
       else if (j.error) msg = typeof j.error === 'string' ? j.error : JSON.stringify(j.error);
     } catch {
@@ -131,9 +137,55 @@
     return msg;
   }
 
+  /**
+   * Ответы Laravel в стиле BrowserExtensionController: { status: boolean, data?: object }.
+   * При status === false — ошибка; иначе полезная нагрузка в data или в корне.
+   */
+  function normalizeCryptChainBody(body) {
+    if (!body || typeof body !== 'object') return body;
+    if (Object.prototype.hasOwnProperty.call(body, 'status')) {
+      const ok = body.status === true || body.status === 1 || body.status === 'ok';
+      if (!ok) {
+        let m = body.message;
+        if (m == null && body.data != null) {
+          if (typeof body.data === 'string') m = body.data;
+          else if (typeof body.data === 'object' && body.data.message != null) m = String(body.data.message);
+        }
+        throw new Error(m != null && m !== '' ? String(m) : 'Запрос отклонён сервером');
+      }
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(body, 'data') &&
+      body.data != null &&
+      typeof body.data === 'object' &&
+      !Array.isArray(body.data)
+    ) {
+      return body.data;
+    }
+    return body;
+  }
+
+  function extractAuthPayload(payload, emailFallback) {
+    const p = normalizeCryptChainBody(payload);
+    const token = p.accessToken || p.token || p.access_token;
+    let user = p.user;
+    if (!user && (p.email || p.id || p.name)) {
+      const em = p.email || emailFallback;
+      user = {
+        id: p.id || p.user_id || em,
+        email: em,
+        name: p.name || (em ? em.split('@')[0] : ''),
+        avatar: p.avatar,
+      };
+    }
+    if (!user && emailFallback) {
+      user = { id: emailFallback, email: emailFallback, name: emailFallback.split('@')[0] };
+    }
+    return { token, user };
+  }
+
   async function login(email, password) {
     const base = await getServerUrl();
-    if (!base) throw new Error('Сначала укажите URL API в Настройки → Система');
     const ok = await requestHostPermissionForBase(base);
     if (!ok) throw new Error('Нет доступа к домену API (разрешите запрос Chrome)');
     const res = await fetch(base + '/auth/login', {
@@ -142,17 +194,15 @@
       body: JSON.stringify({ email, password }),
     });
     if (!res.ok) throw new Error(await parseErrorResponse(res));
-    const data = await res.json();
-    const token = data.accessToken || data.token || data.access_token;
-    if (!token) throw new Error('Сервер не вернул токен (ожидается accessToken)');
-    const user = data.user || { id: data.sub, email, name: data.name || email.split('@')[0] };
+    const raw = await res.json();
+    const { token, user } = extractAuthPayload(raw, email);
+    if (!token) throw new Error('Сервер не вернул токен (в data ожидается accessToken, token или access_token)');
     await setSession(token, user);
     return { accessToken: token, user };
   }
 
   async function register(payload) {
     const base = await getServerUrl();
-    if (!base) throw new Error('Сначала укажите URL API в Настройки → Система');
     const ok = await requestHostPermissionForBase(base);
     if (!ok) throw new Error('Нет доступа к домену API (разрешите запрос Chrome)');
     const res = await fetch(base + '/auth/register', {
@@ -165,10 +215,9 @@
       }),
     });
     if (!res.ok) throw new Error(await parseErrorResponse(res));
-    const data = await res.json();
-    const token = data.accessToken || data.token || data.access_token;
-    if (!token) throw new Error('Сервер не вернул токен после регистрации');
-    const user = data.user || { email: payload.email, name: payload.name };
+    const raw = await res.json();
+    const { token, user } = extractAuthPayload(raw, payload.email);
+    if (!token) throw new Error('Сервер не вернул токен (в data ожидается accessToken, token или access_token)');
     await setSession(token, user);
     return { accessToken: token, user };
   }
@@ -193,7 +242,13 @@
       throw new Error('Сессия истекла — войдите снова');
     }
     if (!res.ok) throw new Error(await parseErrorResponse(res));
-    return res.json();
+    const raw = await res.json();
+    try {
+      return normalizeCryptChainBody(raw);
+    } catch (e) {
+      if (e instanceof Error && e.message) throw e;
+      throw new Error(String(e));
+    }
   }
 
   async function pushSyncState(body) {
@@ -220,6 +275,7 @@
 
   global.VisualBookmarksApi = {
     getServerUrl,
+    getLoginPageUrl,
     setServerUrl,
     hasToken,
     getAccessToken,

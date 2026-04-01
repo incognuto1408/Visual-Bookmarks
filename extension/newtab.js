@@ -1,10 +1,36 @@
 /** Плитка ждёт цвет из favicon (после загрузки подставляется hex) */
 const FAVICON_BG = '__favicon__';
+/** Цвет плитки по умолчанию, если значение битое или пустое */
+const DEFAULT_TILE_BG = '#3b82f6';
+
+/**
+ * Допустимы: маркер favicon, #rgb / #rgba / #rrggbb / #rrggbbaa, linear-gradient(...), rgb()/rgba().
+ * Иначе (например #100c000 — 7 hex-символов) — fallback, чтобы не ломать CSS.
+ */
+function sanitizeBookmarkBackgroundColor(raw, fallback = DEFAULT_TILE_BG) {
+  if (raw === FAVICON_BG) return FAVICON_BG;
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const s = String(raw).trim();
+  if (s === FAVICON_BG) return FAVICON_BG;
+  if (/^linear-gradient\s*\(/i.test(s)) return s;
+  if (/^rgba?\s*\(/i.test(s)) return s;
+  if (
+    /^#[0-9a-fA-F]{3}$/.test(s) ||
+    /^#[0-9a-fA-F]{4}$/.test(s) ||
+    /^#[0-9a-fA-F]{6}$/.test(s) ||
+    /^#[0-9a-fA-F]{8}$/.test(s)
+  ) {
+    return s;
+  }
+  return fallback;
+}
 
 const STORAGE_KEY = 'visualBookmarks_state_v2';
 const STORAGE_KEY_LEGACY = 'visualBookmarks_state_v1';
 const SYNC_FILENAME = 'visual-bookmarks-sync.json';
 const SYNC_DEBOUNCE_MS = 2500;
+/** Интервал между успешными синхронизациями Crypt-Chain (мс); таймер отсчитывается от `lastServerSyncAt` */
+const SERVER_PULL_INTERVAL_MS = 60 * 1000;
 const MIME_JSON = 'application/json; charset=UTF-8';
 
 const PRESET_BACKGROUNDS = [
@@ -55,7 +81,7 @@ const DEFAULT_SETTINGS = {
   searchEngine: 'google',
   showSearch: true,
   gridColumns: 5,
-  maxBookmarks: 18,
+  maxBookmarks: 100,
   bookmarkView: 'icons',
   showBookmarksBar: false,
   showContextSuggestions: true,
@@ -130,13 +156,15 @@ function isExtensionContext() {
   return typeof chrome !== 'undefined' && !!(chrome.runtime && chrome.runtime.id);
 }
 
-/** @type {{ updatedAt: number; driveFileId: string | null; bookmarks: any[]; settings: typeof DEFAULT_SETTINGS; user: any | null }} */
+/** @type {{ updatedAt: number; driveFileId: string | null; bookmarks: any[]; settings: typeof DEFAULT_SETTINGS; user: any | null; lastServerSyncAt: number | null }} */
 let app = {
   updatedAt: 0,
   driveFileId: null,
   bookmarks: [],
   settings: { ...DEFAULT_SETTINGS },
   user: null,
+  /** Успешный обмен с Crypt-Chain (pull/push); следующий фоновый pull не раньше чем через минуту отсюда */
+  lastServerSyncAt: null,
 };
 
 let editingBookmarkId = null;
@@ -200,19 +228,37 @@ function fallbackIconUrl() {
   return 'icons/fallback-earth.svg';
 }
 
+const FAVICON_MESSAGE_MS = 10000;
+
 function getFaviconViaBackground(pageUrl) {
   return new Promise((resolve) => {
     if (!isExtensionContext() || typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
       resolve({ ok: false });
       return;
     }
+    const timer = setTimeout(() => resolve({ ok: false }), FAVICON_MESSAGE_MS);
     chrome.runtime.sendMessage({ type: 'VB_GET_FAVICON', pageUrl }, (response) => {
+      clearTimeout(timer);
       if (chrome.runtime.lastError) {
         resolve({ ok: false });
         return;
       }
       resolve(response && response.ok && response.dataUrl ? response : { ok: false });
     });
+  });
+}
+
+const vbFaviconSessionCache = new Map();
+
+/** Тот же запрос к SW, но один раз на URL за сессию вкладки (без хранения в JSON) */
+function getFaviconCached(pageUrl) {
+  const key = String(pageUrl || '');
+  if (!key) return Promise.resolve({ ok: false });
+  const hit = vbFaviconSessionCache.get(key);
+  if (hit) return Promise.resolve(hit);
+  return getFaviconViaBackground(key).then((fr) => {
+    vbFaviconSessionCache.set(key, fr);
+    return fr;
   });
 }
 
@@ -235,6 +281,18 @@ function wireGridImageFallbacks(gridEl) {
   gridEl.querySelectorAll('.bm-card__body > img.bm-card__img').forEach((img) => wireTileImageFallback(img));
 }
 
+/** Подстановка favicon по URL через service worker (в JSON/sync не храним) */
+function wireTileFaviconLazyLoad(gridEl) {
+  if ((app.settings.bookmarkView || 'icons') === 'screenshots') return;
+  gridEl.querySelectorAll('img[data-vb-favicon]').forEach((img) => {
+    const pageUrl = img.getAttribute('data-vb-favicon');
+    if (!pageUrl) return;
+    getFaviconCached(pageUrl).then((fr) => {
+      if (fr.ok && fr.dataUrl && img.isConnected) img.src = fr.dataUrl;
+    });
+  });
+}
+
 /** Цвет с уже сохранённой иконки или один запрос к SW (при сохранении закладки, не при каждом открытии newtab) */
 async function extractColorFromFaviconData(pageUrl, optionalCachedDataUrl) {
   const cached = clampFaviconDataUrl(optionalCachedDataUrl);
@@ -249,13 +307,19 @@ function screenshotThumb(url) {
 }
 
 function resolveTileBackground(b) {
-  return b.backgroundColor === FAVICON_BG ? '#475569' : b.backgroundColor || '#27272a';
+  if (b.backgroundColor === FAVICON_BG) return '#475569';
+  if (b.backgroundColor == null || b.backgroundColor === '') return '#27272a';
+  return sanitizeBookmarkBackgroundColor(b.backgroundColor, '#27272a');
 }
 
 function contrastColor(hex) {
   if (!hex || hex === FAVICON_BG || String(hex).startsWith('linear')) return '#ffffff';
-  const h = String(hex).replace('#', '');
-  if (h.length !== 6) return '#ffffff';
+  if (/^rgba?\s*\(/i.test(String(hex))) return '#ffffff';
+  let h = String(hex).replace('#', '');
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  else if (h.length === 4) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  else if (h.length === 8) h = h.slice(0, 6);
+  if (h.length !== 6 || !/^[0-9a-fA-F]{6}$/i.test(h)) return '#ffffff';
   const r = parseInt(h.slice(0, 2), 16);
   const g = parseInt(h.slice(2, 4), 16);
   const b = parseInt(h.slice(4, 6), 16);
@@ -263,8 +327,57 @@ function contrastColor(hex) {
   return L > 0.55 ? '#000000' : '#ffffff';
 }
 
+const MAX_BOOKMARKS_LIMIT = 100;
+const MIN_BOOKMARKS_LIMIT = 6;
+
+function clampMaxBookmarksValue(n) {
+  const v = typeof n === 'number' && !Number.isNaN(n) ? Math.round(n) : DEFAULT_SETTINGS.maxBookmarks;
+  return Math.min(MAX_BOOKMARKS_LIMIT, Math.max(MIN_BOOKMARKS_LIMIT, v));
+}
+
+/** Лимит плиток / хранения; не доверяем сырому settings (null с сервера даёт «>= 0» и вечный disabled). */
+function effectiveMaxBookmarks() {
+  return clampMaxBookmarksValue(app.settings.maxBookmarks);
+}
+
+/** Если в хранилище закладок больше, чем лимит (синк, импорт), поднимаем лимит до min(100, count), иначе «Добавить» серое. */
+function syncMaxBookmarksToStoredCount() {
+  const len = app.bookmarks.length;
+  const m = effectiveMaxBookmarks();
+  if (len > m) {
+    app.settings.maxBookmarks = Math.min(MAX_BOOKMARKS_LIMIT, Math.max(MIN_BOOKMARKS_LIMIT, len));
+    touchUpdated();
+  } else {
+    app.settings.maxBookmarks = m;
+  }
+}
+
 function mergeSettings(base, patch) {
-  return { ...base, ...patch };
+  const out = { ...base, ...patch };
+  let n = out.maxBookmarks;
+  if (typeof n !== 'number' || Number.isNaN(n)) {
+    n =
+      typeof base.maxBookmarks === 'number' && !Number.isNaN(base.maxBookmarks)
+        ? base.maxBookmarks
+        : DEFAULT_SETTINGS.maxBookmarks;
+  }
+  out.maxBookmarks = clampMaxBookmarksValue(n);
+  return out;
+}
+
+/**
+ * Пользовательский фон «Загрузить свой фон» хранится как data URL и раздувает JSON.
+ * Для экспорта файла, Google Drive и синка с сервером подставляем пресет по умолчанию.
+ * Локально в chrome.storage полный фон по-прежнему сохраняется через saveLocal().
+ */
+function stripEmbeddedBackgroundForExternal(settings) {
+  if (!settings || typeof settings !== 'object') return settings;
+  const out = { ...settings };
+  const bg = out.background;
+  if (bg && bg.type === 'image' && typeof bg.value === 'string' && bg.value.startsWith('data:')) {
+    out.background = { type: 'preset', value: DEFAULT_SETTINGS.background.value };
+  }
+  return out;
 }
 
 function sortedBookmarks() {
@@ -289,11 +402,15 @@ async function loadState() {
         app.user = raw.user || null;
         app.driveFileId = raw.driveFileId ?? null;
         app.updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : 0;
+        app.lastServerSyncAt =
+          typeof raw.lastServerSyncAt === 'number' && raw.lastServerSyncAt > 0 ? raw.lastServerSyncAt : null;
         if (!app.bookmarks.length) app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
       } else {
         app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
         app.settings = { ...DEFAULT_SETTINGS };
+        app.lastServerSyncAt = null;
       }
+      syncMaxBookmarksToStoredCount();
       resolve();
     });
   });
@@ -304,7 +421,7 @@ function migrateLegacy(leg) {
     id: b.id || generateId(),
     title: b.title || hostFromUrl(b.url),
     url: normalizeUrl(b.url),
-    backgroundColor: b.backgroundColor || b.color || '#3b82f6',
+    backgroundColor: sanitizeBookmarkBackgroundColor(b.backgroundColor || b.color, DEFAULT_TILE_BG),
     description: b.description,
     order: i,
     clickCount: b.clickCount || 0,
@@ -324,10 +441,12 @@ function normalizeBookmark(b) {
   if (backgroundColor === FAVICON_BG) {
     /* оставляем маркер — позже enrichFaviconBackgrounds */
   } else if (backgroundColor == null || backgroundColor === '') {
-    backgroundColor = '#3b82f6';
+    backgroundColor = DEFAULT_TILE_BG;
+  } else {
+    backgroundColor = sanitizeBookmarkBackgroundColor(backgroundColor, DEFAULT_TILE_BG);
   }
-  const fav = clampFaviconDataUrl(b.faviconDataUrl);
-  const out = {
+  /* faviconDataUrl не храним: иконки подгружаются по URL (SW) при показе сетки */
+  return {
     id: b.id || generateId(),
     title: b.title || hostFromUrl(b.url),
     url: normalizeUrl(b.url),
@@ -336,23 +455,41 @@ function normalizeBookmark(b) {
     order: typeof b.order === 'number' ? b.order : 0,
     clickCount: b.clickCount || 0,
   };
-  if (fav) out.faviconDataUrl = fav;
-  return out;
+}
+
+/** Для синка / экспорта / Drive / chrome.storage — без data URL иконок */
+function bookmarksWithoutFaviconPayload(bookmarks) {
+  return bookmarks.map((b) => {
+    const o = { ...b };
+    delete o.faviconDataUrl;
+    return o;
+  });
 }
 
 function saveLocal() {
   const payload = {
     updatedAt: app.updatedAt,
     driveFileId: app.driveFileId,
-    bookmarks: app.bookmarks,
+    bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
     settings: app.settings,
     user: app.user,
+    lastServerSyncAt: typeof app.lastServerSyncAt === 'number' ? app.lastServerSyncAt : null,
   };
   return new Promise((r) => storageLocal.set({ [STORAGE_KEY]: payload }, r));
 }
 
 function exportJsonString() {
-  return JSON.stringify({ bookmarks: app.bookmarks, settings: app.settings, user: app.user, updatedAt: app.updatedAt, version: 2 }, null, 2);
+  return JSON.stringify(
+    {
+      bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
+      settings: stripEmbeddedBackgroundForExternal(app.settings),
+      user: app.user,
+      updatedAt: app.updatedAt,
+      version: 2,
+    },
+    null,
+    2
+  );
 }
 
 function importFromJson(text) {
@@ -360,6 +497,7 @@ function importFromJson(text) {
   if (data.bookmarks) app.bookmarks = data.bookmarks.map(normalizeBookmark).filter(Boolean);
   if (data.settings) app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, data.settings);
   if (data.user !== undefined) app.user = data.user;
+  syncMaxBookmarksToStoredCount();
   touchUpdated();
 }
 
@@ -367,6 +505,7 @@ function resetDefaults() {
   app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
   app.settings = { ...DEFAULT_SETTINGS };
   app.user = null;
+  app.lastServerSyncAt = null;
   touchUpdated();
 }
 
@@ -421,7 +560,16 @@ async function driveDownload(token, fileId) {
 }
 
 function drivePayload() {
-  return JSON.stringify({ version: 2, updatedAt: app.updatedAt, bookmarks: app.bookmarks, settings: app.settings }, null, 2);
+  return JSON.stringify(
+    {
+      version: 2,
+      updatedAt: app.updatedAt,
+      bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
+      settings: stripEmbeddedBackgroundForExternal(app.settings),
+    },
+    null,
+    2
+  );
 }
 
 async function pushDrive(token) {
@@ -461,29 +609,122 @@ async function pushServerState() {
   await VisualBookmarksApi.pushSyncState({
     version: 2,
     updatedAt: app.updatedAt,
-    bookmarks: app.bookmarks,
-    settings: app.settings,
+    bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
+    settings: stripEmbeddedBackgroundForExternal(app.settings),
   });
 }
 
-async function pullServerMerge() {
+/**
+ * После входа или регистрации Crypt-Chain.
+ * Вход: подтягиваем сервер и сливаем с локальным по `updatedAt` (как ручная синхронизация).
+ * Регистрация: на пустом сервере (204) оставляем локальные закладки/настройки и отправляем их на сервер.
+ */
+async function applyServerStateAfterAuth(opts = {}) {
+  if (typeof VisualBookmarksApi === 'undefined') return;
+  const isRegistration = !!opts.isRegistration;
+
+  if (!isRegistration) {
+    await pullServerMerge({ allowSeedPush: true });
+    return;
+  }
+
+  const remote = await VisualBookmarksApi.pullSyncState();
+  if (remote == null) {
+    if (!app.bookmarks.length) {
+      app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+    }
+    syncMaxBookmarksToStoredCount();
+    if (await enrichFaviconBackgrounds()) touchUpdated();
+    await pushServerState();
+    app.lastServerSyncAt = Date.now();
+    await saveLocal();
+    renderAll();
+    return;
+  }
+  await pullServerMerge({ allowSeedPush: true });
+}
+
+/**
+ * Слияние с сервером Crypt-Chain.
+ * @param {{ allowSeedPush?: boolean }} opts — allowSeedPush: при 204 один раз отправить локальное состояние (вход, ручная синхронизация); false для таймера, чтобы не дёргать PUT каждую минуту.
+ */
+async function pullServerMerge(opts = {}) {
+  const allowSeedPush = opts.allowSeedPush !== false;
   if (typeof VisualBookmarksApi === 'undefined') return;
   const remote = await VisualBookmarksApi.pullSyncState();
   if (remote == null) {
-    if (app.bookmarks.length || app.updatedAt) await pushServerState();
-    return;
+    if (allowSeedPush && (app.bookmarks.length || app.updatedAt)) await pushServerState();
+  } else {
+    const ru = typeof remote.updatedAt === 'number' ? remote.updatedAt : 0;
+    if (ru > app.updatedAt) {
+      if (Array.isArray(remote.bookmarks)) {
+        const mapped = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
+        app.bookmarks =
+          mapped.length > 0 ? mapped : DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+      }
+      if (remote.settings && typeof remote.settings === 'object') {
+        app.settings = mergeSettings(
+          { ...DEFAULT_SETTINGS },
+          stripEmbeddedBackgroundForExternal(remote.settings)
+        );
+      }
+      app.updatedAt = ru;
+      syncMaxBookmarksToStoredCount();
+      if (await enrichFaviconBackgrounds()) touchUpdated();
+      renderAll();
+    } else if (app.updatedAt > ru) {
+      await pushServerState();
+    }
   }
-  const ru = typeof remote.updatedAt === 'number' ? remote.updatedAt : 0;
-  if (ru > app.updatedAt) {
-    if (remote.bookmarks) app.bookmarks = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
-    if (remote.settings) app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, remote.settings);
-    app.updatedAt = ru;
-    if (await enrichFaviconBackgrounds()) touchUpdated();
-    await saveLocal();
-    renderAll();
-  } else if (app.updatedAt > ru) {
-    await pushServerState();
+  app.lastServerSyncAt = Date.now();
+  await saveLocal();
+}
+
+let serverPeriodicPullTimer = null;
+
+function stopServerPeriodicPull() {
+  if (serverPeriodicPullTimer != null) {
+    clearTimeout(serverPeriodicPullTimer);
+    serverPeriodicPullTimer = null;
   }
+}
+
+/** Сколько ждать до следующего фонового pull от последней успешной синхронизации Crypt-Chain */
+function delayUntilNextServerPullMs() {
+  const last = app.lastServerSyncAt;
+  if (last == null || typeof last !== 'number' || last <= 0) {
+    return SERVER_PULL_INTERVAL_MS;
+  }
+  return Math.max(0, SERVER_PULL_INTERVAL_MS - (Date.now() - last));
+}
+
+async function runServerPeriodicPullTick() {
+  serverPeriodicPullTimer = null;
+  try {
+    if (typeof VisualBookmarksApi === 'undefined' || !(await VisualBookmarksApi.hasToken())) {
+      stopServerPeriodicPull();
+      return;
+    }
+    await pullServerMerge({ allowSeedPush: false });
+    await restartServerPeriodicPull();
+  } catch (e) {
+    console.warn('Periodic server sync:', e);
+    stopServerPeriodicPull();
+    serverPeriodicPullTimer = setTimeout(() => {
+      void runServerPeriodicPullTick();
+    }, SERVER_PULL_INTERVAL_MS);
+  }
+}
+
+/** Планирует следующий pull через `delayUntilNextServerPullMs()` после последней успешной синхронизации */
+async function restartServerPeriodicPull() {
+  stopServerPeriodicPull();
+  if (typeof VisualBookmarksApi === 'undefined') return;
+  if (!(await VisualBookmarksApi.hasToken())) return;
+  const delay = delayUntilNextServerPullMs();
+  serverPeriodicPullTimer = setTimeout(() => {
+    void runServerPeriodicPullTick();
+  }, delay);
 }
 
 async function pullRemoteMerge() {
@@ -501,17 +742,27 @@ async function pullRemoteMerge() {
   } catch (_) {}
 }
 
-const debouncedPush = debounce(async () => {
+/** Один проход: Crypt-Chain при активной сессии, иначе тихий push в Google Drive. Без ожидания из UI. */
+async function pushRemoteStateOnce() {
   try {
     if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
       await pushServerState();
+      app.lastServerSyncAt = Date.now();
+      await saveLocal();
+      void restartServerPeriodicPull();
       return;
     }
-  } catch (_) {}
+  } catch (e) {
+    console.warn('Сервер синхронизации:', e);
+  }
   try {
     const t = await getToken(false);
     await pushDrive(t);
   } catch (_) {}
+}
+
+const debouncedPush = debounce(() => {
+  void pushRemoteStateOnce();
 }, SYNC_DEBOUNCE_MS);
 
 function debounce(fn, ms) {
@@ -534,20 +785,34 @@ async function pullDriveMerge(token) {
   const ru = remote.updatedAt || 0;
   if (ru > app.updatedAt) {
     if (remote.bookmarks) app.bookmarks = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
-    if (remote.settings) app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, remote.settings);
+    if (remote.settings) {
+      app.settings = mergeSettings(
+        { ...DEFAULT_SETTINGS },
+        stripEmbeddedBackgroundForExternal(remote.settings)
+      );
+    }
     app.updatedAt = ru;
+    syncMaxBookmarksToStoredCount();
     if (await enrichFaviconBackgrounds()) touchUpdated();
     await saveLocal();
     renderAll();
   } else if (app.updatedAt > ru) await pushDrive(token);
 }
 
-async function persist() {
+/**
+ * Локально: сразу сохраняет и перерисовывает. Сеть (сервер / Drive) — только в фоне, без блокировки UI.
+ * @param {boolean} [immediateServerPush] — поставить фоновую отправку сразу (иначе debounce 2,5 с).
+ */
+async function persist(immediateServerPush = false) {
   touchUpdated();
   await saveLocal();
   renderAll();
   renderSettingsIfOpen();
-  debouncedPush();
+  if (immediateServerPush) {
+    void pushRemoteStateOnce();
+  } else {
+    debouncedPush();
+  }
 }
 
 /* --- Theme & background --- */
@@ -761,7 +1026,7 @@ function renderBookmarksBar() {
   bar.classList.remove('is-hidden');
   const linkRel = app.settings.openLinksInNewTab ? ' target="_blank" rel="noopener noreferrer"' : ' rel="noopener noreferrer"';
   bar.innerHTML = sortedBookmarks()
-    .slice(0, app.settings.maxBookmarks)
+    .slice(0, effectiveMaxBookmarks())
     .map(
       (b) =>
         '<a class="bookmarks-bar__link" href="' +
@@ -815,8 +1080,9 @@ function renderGrid() {
   const cols = Math.min(6, Math.max(2, app.settings.gridColumns || 5));
   grid.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
 
-  const list = sortedBookmarks().slice(0, app.settings.maxBookmarks);
-  const atMax = app.bookmarks.length >= app.settings.maxBookmarks;
+  const maxBm = effectiveMaxBookmarks();
+  const list = sortedBookmarks().slice(0, maxBm);
+  const atMax = app.bookmarks.length >= maxBm;
   let html = '';
 
   list.forEach((b, index) => {
@@ -824,13 +1090,9 @@ function renderGrid() {
     const tc = contrastColor(tileBg);
     const bg = tileBg.startsWith('linear') ? 'background:' + tileBg : 'background-color:' + tileBg;
     const view = app.settings.bookmarkView || 'icons';
-    const imgSrc =
-      view === 'screenshots'
-        ? screenshotThumb(b.url)
-        : b.faviconDataUrl && String(b.faviconDataUrl).startsWith('data:')
-          ? b.faviconDataUrl
-          : fallbackIconUrl();
+    const imgSrc = view === 'screenshots' ? screenshotThumb(b.url) : fallbackIconUrl();
     const imgClass = view === 'screenshots' ? 'bm-card__img bm-card__img--shot' : 'bm-card__img bm-card__img--icon';
+    const favLazyAttr = view !== 'screenshots' ? ' data-vb-favicon="' + escapeAttr(b.url) + '"' : '';
     const menuOpen = openCardMenuId === b.id;
     html +=
       '<div class="bm-card-wrap' +
@@ -871,7 +1133,9 @@ function renderGrid() {
     html +=
       '<img class="' +
       imgClass +
-      '" src="' +
+      '"' +
+      favLazyAttr +
+      ' src="' +
       escapeAttr(imgSrc) +
       '" alt="" referrerpolicy="no-referrer"/>' +
       '<div class="bm-card__letter" style="display:none;background:rgba(255,255,255,0.2);color:' +
@@ -892,6 +1156,7 @@ function renderGrid() {
   grid.innerHTML = html;
 
   wireGridImageFallbacks(grid);
+  wireTileFaviconLazyLoad(grid);
 
   grid.querySelector('#gridAddBm')?.addEventListener('click', () => openBookmarkModal(null));
 
@@ -998,7 +1263,7 @@ function reorderBookmarks(from, to) {
     const x = app.bookmarks.find((y) => y.id === b.id);
     if (x) x.order = i;
   });
-  persist();
+  void persist(true);
 }
 
 function openBookmarkModal(bm) {
@@ -1011,7 +1276,7 @@ function openBookmarkModal(bm) {
   $('bmUrl').value = bm?.url || '';
   $('bmDesc').value = bm?.description || '';
   const rawCol = bm?.backgroundColor;
-  let col = '#3b82f6';
+  let col = DEFAULT_TILE_BG;
   if (rawCol === FAVICON_BG) {
     bmAutoColor = true;
     $('bmAutoColor').classList.add('is-active');
@@ -1020,7 +1285,9 @@ function openBookmarkModal(bm) {
       try {
         let u = bm.url;
         if (!/^https?:/i.test(u)) u = 'https://' + u;
-        const sampled = await extractColorFromFaviconData(u, bm.faviconDataUrl);
+        const fr = await getFaviconViaBackground(u);
+        const fd = fr.ok && fr.dataUrl ? clampFaviconDataUrl(fr.dataUrl) : undefined;
+        const sampled = await extractColorFromFaviconData(u, fd);
         col = sampled;
         $('bmColorPicker').value = col;
         renderColorPresets(col);
@@ -1080,21 +1347,31 @@ function updateBmPreview() {
     let u = url.trim();
     if (u && !/^https?:/i.test(u)) u = 'https://' + u;
     if (u) pageBase = u;
-    if (pageBase && editingBookmarkId) {
-      const eb = app.bookmarks.find((x) => x.id === editingBookmarkId);
-      const norm = normalizeUrl(url.trim());
-      if (eb && eb.url === norm && eb.faviconDataUrl) previewIconSrc = eb.faviconDataUrl;
-    }
   } catch (_) {}
   $('bmPreview').style.backgroundColor = bg;
   $('bmPreview').innerHTML =
     (pageBase
       ? '<img src="' +
         escapeAttr(previewIconSrc) +
-        '" width="32" height="32" alt="" referrerpolicy="no-referrer" class="bm-preview-favicon"/>'
-      : '') + '<span style="font-size:0.75rem;font-weight:500;color:' + tc + '">' + escapeHtml(title) + '</span>';
+        '" width="32" height="32" alt="" referrerpolicy="no-referrer" class="bm-preview-favicon" data-vb-favicon="' +
+        escapeAttr(normalizeUrl(url.trim())) +
+        '"/>'
+      : '') +
+    '<span class="bm-preview__title" style="color:' +
+    tc +
+    '">' +
+    escapeHtml(title) +
+    '</span>';
   const prevImg = $('bmPreview').querySelector('img.bm-preview-favicon');
-  if (prevImg) wireTileImageFallback(prevImg);
+  if (prevImg) {
+    wireTileImageFallback(prevImg);
+    const pu = prevImg.getAttribute('data-vb-favicon');
+    if (pu) {
+      getFaviconCached(pu).then((fr) => {
+        if (fr.ok && fr.dataUrl && prevImg.isConnected) prevImg.src = fr.dataUrl;
+      });
+    }
+  }
   syncBookmarkAutoButtonState();
 }
 
@@ -1213,15 +1490,34 @@ async function enrichFaviconBackgrounds() {
       try {
         const fr = await getFaviconViaBackground(b.url);
         const fd = fr.ok && fr.dataUrl ? clampFaviconDataUrl(fr.dataUrl) : undefined;
-        if (fd) b.faviconDataUrl = fd;
-        else delete b.faviconDataUrl;
         b.backgroundColor = await extractColorFromFaviconData(b.url, fd);
       } catch {
-        b.backgroundColor = '#3b82f6';
+        b.backgroundColor = DEFAULT_TILE_BG;
       }
     })
   );
   return true;
+}
+
+/** После мгновенного добавления с авто-цветом — в фоне подставляет цвет по favicon. */
+async function refineBookmarkTileColor(bookmarkId, pageUrl) {
+  const u0 = normalizeUrl(pageUrl);
+  try {
+    const bg = await Promise.race([
+      extractColorFromFaviconData(pageUrl),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+    ]);
+    const sanitized = sanitizeBookmarkBackgroundColor(bg, DEFAULT_TILE_BG);
+    const b = app.bookmarks.find((x) => x.id === bookmarkId);
+    if (!b || normalizeUrl(b.url) !== u0) return;
+    b.backgroundColor = sanitized;
+    touchUpdated();
+    await saveLocal();
+    renderAll();
+    void pushRemoteStateOnce();
+  } catch (_) {
+    /* офлайн / таймаут — плитка уже с дефолтным фоном */
+  }
 }
 
 /* --- Settings panels --- */
@@ -1330,10 +1626,14 @@ function renderSettingsPanels() {
     '<section class="mb-6">' +
     '<h2 class="settings-section-title">Закладки</h2>' +
     '<div class="settings-row"><label class="settings-label-inline">Количество</label>' +
-    '<input type="range" class="settings-range" min="6" max="30" id="rangeMaxBm" value="' +
-    (s.maxBookmarks ?? 18) +
+    '<input type="range" class="settings-range" min="' +
+    MIN_BOOKMARKS_LIMIT +
+    '" max="' +
+    MAX_BOOKMARKS_LIMIT +
+    '" id="rangeMaxBm" value="' +
+    (s.maxBookmarks ?? DEFAULT_SETTINGS.maxBookmarks) +
     '"/><span style="width:2rem;text-align:center;font-size:0.875rem" id="maxBmLabel">' +
-    (s.maxBookmarks ?? 18) +
+    (s.maxBookmarks ?? DEFAULT_SETTINGS.maxBookmarks) +
     '</span></div>' +
     '<div class="settings-row" style="margin-top:0.75rem"><label class="settings-label-inline">Вид</label>' +
     '<select class="settings-select" id="selView">' +
@@ -1365,13 +1665,13 @@ function renderSettingsPanels() {
     '</div></section>';
 
   $('settingsPanelSystem').innerHTML =
-    '<section class="mb-6"><h2 class="settings-section-title">Ваш сервер</h2>' +
-    '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">URL API для входа, регистрации и синхронизации. Контракт — файл SERVER_API.md в папке расширения.</p>' +
+    '<section class="mb-6"><h2 class="settings-section-title">Аккаунт</h2>' +
+    '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">Вход на Crypt-Chain. <strong>Вход:</strong> данные с сервера сливаются с локальными по времени последнего изменения (что новее — то главное; при пустом облаке уходит локальная копия). <strong>Регистрация:</strong> ваши текущие закладки и настройки отправляются в облако. Синхронизация в фоне; следующая проверка сервера — не раньше минуты после последней успешной синхронизации. Кнопка «Синхронизировать» — сразу.</p>' +
     '<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:0.5rem">' +
-    '<input type="url" class="settings-select" style="max-width:100%;box-sizing:border-box" id="inputServerApiUrl" placeholder="https://api.example.com"/>' +
+    '<p style="font-size:0.8rem;margin:0"><a href="#" id="linkCryptChainLogin" style="color:#2563eb;text-decoration:underline">Открыть страницу входа crypt-chain.com</a></p>' +
     '<div style="display:flex;flex-wrap:wrap;gap:0.5rem">' +
-    '<button type="button" class="backup-btn" id="btnSaveServerUrl">Сохранить URL</button>' +
-    '<button type="button" class="backup-btn" id="btnServerLogout">Выйти с сервера</button></div>' +
+    '<button type="button" class="backup-btn" id="btnServerSync">Синхронизировать</button>' +
+    '<button type="button" class="backup-btn" id="btnServerLogout">Выйти из аккаунта</button></div>' +
     '<p id="serverApiStatus" style="font-size:0.75rem;color:#6b7280;margin:0"></p></div></section>' +
     '<section class="mb-6"><h2 class="settings-section-title">Google Drive</h2>' +
     '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">Синхронизация, если не используете сервер (при активной сессии сервера Drive не вызывается).</p>' +
@@ -1452,7 +1752,7 @@ function wireSettingsAppearance(totalPages) {
 
 function wireSettingsBookmarks() {
   $('rangeMaxBm').addEventListener('input', () => {
-    app.settings.maxBookmarks = +$('rangeMaxBm').value;
+    app.settings.maxBookmarks = clampMaxBookmarksValue(+$('rangeMaxBm').value);
     $('maxBmLabel').textContent = String(app.settings.maxBookmarks);
     persist();
     renderGrid();
@@ -1482,40 +1782,45 @@ function wireSettingsBookmarks() {
 }
 
 function wireSettingsSystem() {
-  (async () => {
-    if (typeof VisualBookmarksApi !== 'undefined') {
-      try {
-        $('inputServerApiUrl').value = await VisualBookmarksApi.getServerUrl();
-      } catch (_) {}
-    }
-  })();
+  const st = $('serverApiStatus');
+  $('linkCryptChainLogin').addEventListener('click', (e) => {
+    e.preventDefault();
+    const url =
+      typeof VisualBookmarksApi !== 'undefined' && VisualBookmarksApi.getLoginPageUrl
+        ? VisualBookmarksApi.getLoginPageUrl()
+        : 'https://crypt-chain.com/browser-extension/login';
+    window.open(url, '_blank', 'noopener,noreferrer');
+  });
 
-  $('btnSaveServerUrl').addEventListener('click', async () => {
-    const st = $('serverApiStatus');
+  $('btnServerSync').addEventListener('click', async () => {
     if (typeof VisualBookmarksApi === 'undefined') {
       st.textContent = 'Клиент API не загружен';
       return;
     }
+    if (!(await VisualBookmarksApi.hasToken())) {
+      st.textContent = 'Сначала войдите в аккаунт.';
+      return;
+    }
+    st.textContent = 'Синхронизация…';
     try {
-      const v = $('inputServerApiUrl').value.trim();
-      await VisualBookmarksApi.setServerUrl(v);
-      if (v) {
-        const ok = await VisualBookmarksApi.requestHostPermissionForBase(v);
-        st.textContent = ok ? 'URL сохранён, доступ к домену разрешён' : 'URL сохранён — разрешите доступ при запросе Chrome';
-      } else {
-        st.textContent = 'URL очищен';
-      }
+      await pullServerMerge({ allowSeedPush: true });
+      st.textContent = 'Синхронизация выполнена, ' + new Date().toLocaleTimeString();
+      await restartServerPeriodicPull();
     } catch (e) {
       st.textContent = e.message || String(e);
     }
+    renderAll();
+    renderHeader();
+    renderSettingsIfOpen();
   });
 
   $('btnServerLogout').addEventListener('click', async () => {
-    const st = $('serverApiStatus');
+    stopServerPeriodicPull();
     if (typeof VisualBookmarksApi !== 'undefined') await VisualBookmarksApi.logout();
     app.user = null;
+    app.lastServerSyncAt = null;
     await saveLocal();
-    st.textContent = 'Сессия сервера сброшена';
+    st.textContent = 'Сессия сброшена';
     renderAll();
     renderHeader();
   });
@@ -1533,9 +1838,18 @@ function wireSettingsSystem() {
   $('backupReset').addEventListener('click', async () => {
     if (!confirm('Сбросить все закладки и настройки?')) return;
     resetDefaults();
-    if (await enrichFaviconBackgrounds()) touchUpdated();
     await persist();
     hideModal('modalSettings');
+    void (async () => {
+      try {
+        if (await enrichFaviconBackgrounds()) {
+          touchUpdated();
+          await saveLocal();
+          renderAll();
+          debouncedPush();
+        }
+      } catch (_) {}
+    })();
   });
   const status = $('driveStatus');
   getToken(false)
@@ -1788,11 +2102,6 @@ async function init() {
 
   $('loader').classList.add('is-hidden');
 
-  if (await enrichFaviconBackgrounds()) {
-    touchUpdated();
-    await saveLocal();
-  }
-
   document.addEventListener('click', onGlobalClick);
 
   $('btnLogin').addEventListener('click', () => {
@@ -1883,23 +2192,19 @@ async function init() {
     if (!email || !pwd) return;
 
     if (typeof VisualBookmarksApi !== 'undefined') {
-      const base = await VisualBookmarksApi.getServerUrl();
-      if (base) {
-        try {
-          if (authMode === 'login') await VisualBookmarksApi.login(email, pwd);
-          else await VisualBookmarksApi.register({ email, password: pwd, name });
-          const su = await VisualBookmarksApi.getStoredUser();
-          app.user = normalizeServerUser(su);
-          hideModal('modalAuth');
-          await pullServerMerge();
-          await saveLocal();
-          renderAll();
-          renderHeader();
-        } catch (err) {
-          alert(err.message || String(err));
-        }
-        return;
+      try {
+        if (authMode === 'login') await VisualBookmarksApi.login(email, pwd);
+        else await VisualBookmarksApi.register({ email, password: pwd, name });
+        const su = await VisualBookmarksApi.getStoredUser();
+        app.user = normalizeServerUser(su);
+        hideModal('modalAuth');
+        await applyServerStateAfterAuth({ isRegistration: authMode === 'register' });
+        renderHeader();
+        await restartServerPeriodicPull();
+      } catch (err) {
+        alert(err.message || String(err));
       }
+      return;
     }
 
     app.user = {
@@ -1914,30 +2219,31 @@ async function init() {
 
   $('formBookmark').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const btn = $('bmSubmit');
+    if (btn.disabled) return;
+
     const title = $('bmTitle').value.trim();
-    const url = normalizeUrl($('bmUrl').value);
+    const url = normalizeUrl($('bmUrl').value.trim());
     const desc = $('bmDesc').value.trim();
-    if (!title || !url) return;
-    const bExisting = editingBookmarkId ? app.bookmarks.find((x) => x.id === editingBookmarkId) : null;
-    const urlUnchanged = !!(bExisting && bExisting.url === url);
-
-    let favData;
-    if (urlUnchanged && bExisting) {
-      favData = bExisting.faviconDataUrl;
-    } else {
-      const fr = await getFaviconViaBackground(url);
-      favData = fr.ok && fr.dataUrl ? clampFaviconDataUrl(fr.dataUrl) : undefined;
+    if (!title) {
+      alert('Введите название закладки.');
+      $('bmTitle').focus();
+      return;
+    }
+    if (!url) {
+      alert('Введите адрес ссылки (URL).');
+      $('bmUrl').focus();
+      return;
     }
 
-    let bg = $('bmColorPicker').value;
     const fromFavicon = bmAutoColor || (!editingBookmarkId && !bmColorUserTouched);
+    let bg = sanitizeBookmarkBackgroundColor($('bmColorPicker').value, DEFAULT_TILE_BG);
     if (fromFavicon) {
-      try {
-        bg = await extractColorFromFaviconData(url, favData);
-      } catch {
-        bg = '#3b82f6';
-      }
+      bg = DEFAULT_TILE_BG;
     }
+
+    let targetId = editingBookmarkId;
+    let newId = null;
 
     if (editingBookmarkId) {
       const b = app.bookmarks.find((x) => x.id === editingBookmarkId);
@@ -1946,18 +2252,40 @@ async function init() {
         b.url = url;
         b.description = desc;
         b.backgroundColor = bg;
-        if (favData) b.faviconDataUrl = favData;
-        else delete b.faviconDataUrl;
+        delete b.faviconDataUrl;
       }
     } else {
-      if (app.bookmarks.length >= app.settings.maxBookmarks) return;
+      const cap = effectiveMaxBookmarks();
+      if (app.bookmarks.length >= cap) {
+        alert(
+          'Достигнут лимит закладок (' +
+            cap +
+            '). Увеличьте лимит во вкладке «Закладки» в настройках.'
+        );
+        return;
+      }
+      newId = generateId();
+      targetId = newId;
       const maxO = Math.max(0, ...app.bookmarks.map((x) => x.order || 0));
-      const row = { id: generateId(), title, url, description: desc, backgroundColor: bg, order: maxO + 1, clickCount: 0 };
-      if (favData) row.faviconDataUrl = favData;
-      app.bookmarks.push(row);
+      app.bookmarks.push({
+        id: newId,
+        title,
+        url,
+        description: desc,
+        backgroundColor: bg,
+        order: maxO + 1,
+        clickCount: 0,
+      });
     }
-    hideModal('modalBookmark');
-    persist();
+
+    try {
+      await persist(true);
+      hideModal('modalBookmark');
+      if (fromFavicon && targetId) void refineBookmarkTileColor(targetId, url);
+    } catch (err) {
+      console.error(err);
+      alert('Не удалось сохранить закладку: ' + (err.message || String(err)));
+    }
   });
 
   $('bmColorPicker').addEventListener('input', () => {
@@ -1982,10 +2310,9 @@ async function init() {
     $('bmAutoLabel').classList.add('is-hidden');
     let u = url;
     if (!/^https?:/i.test(u)) u = 'https://' + u;
-    const eb = editingBookmarkId ? app.bookmarks.find((x) => x.id === editingBookmarkId) : null;
-    const nu = normalizeUrl(url);
-    const cached = eb && eb.url === nu ? eb.faviconDataUrl : undefined;
-    const col = await extractColorFromFaviconData(u, cached);
+    const fr = await getFaviconViaBackground(u);
+    const fd = fr.ok && fr.dataUrl ? clampFaviconDataUrl(fr.dataUrl) : undefined;
+    const col = await extractColorFromFaviconData(u, fd);
     $('bmColorPicker').value = col;
     renderColorPresets(col);
     updateBmPreview();
@@ -1997,12 +2324,12 @@ async function init() {
     deletingBookmarkId = null;
     hideModal('modalDelete');
   });
-  $('btnDeleteConfirm').addEventListener('click', () => {
+  $('btnDeleteConfirm').addEventListener('click', async () => {
     if (deletingBookmarkId) {
       app.bookmarks = app.bookmarks.filter((b) => b.id !== deletingBookmarkId);
       deletingBookmarkId = null;
       hideModal('modalDelete');
-      persist();
+      await persist(true);
     }
   });
 
@@ -2026,9 +2353,18 @@ async function init() {
     f.text().then(async (text) => {
       try {
         importFromJson(text);
-        if (await enrichFaviconBackgrounds()) touchUpdated();
-        await persist();
+        await persist(true);
         hideModal('modalSettings');
+        void (async () => {
+          try {
+            if (await enrichFaviconBackgrounds()) {
+              touchUpdated();
+              await saveLocal();
+              renderAll();
+              debouncedPush();
+            }
+          } catch (_) {}
+        })();
       } catch (err) {
         alert('Ошибка импорта: ' + err.message);
       }
@@ -2067,15 +2403,31 @@ async function init() {
     if (document.visibilityState === 'visible') {
       pullRemoteMerge()
         .catch(() => {})
-        .finally(() => renderAll());
+        .finally(async () => {
+          renderAll();
+          if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
+            await restartServerPeriodicPull();
+          }
+        });
     }
   });
 
-  try {
-    await pullRemoteMerge();
-  } catch (_) {}
-
   renderAll();
+
+  void pullRemoteMerge()
+    .catch(() => {})
+    .finally(async () => {
+      renderAll();
+      await restartServerPeriodicPull();
+      try {
+        if (await enrichFaviconBackgrounds()) {
+          touchUpdated();
+          await saveLocal();
+          renderAll();
+          debouncedPush();
+        }
+      } catch (_) {}
+    });
 }
 
 init();

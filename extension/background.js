@@ -40,14 +40,26 @@ function isProbablyHtmlBody(buf) {
   return head.startsWith('<!doctype') || head.startsWith('<html') || head.startsWith('<head');
 }
 
+const FAVICON_FETCH_MS = 8000;
+
 async function tryFetchVerifiedFavicon(url) {
-  const res = await fetch(url, {
-    method: 'GET',
-    redirect: 'follow',
-    credentials: 'omit',
-    cache: 'force-cache',
-  });
-  if (!res.ok) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FAVICON_FETCH_MS);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      credentials: 'omit',
+      cache: 'force-cache',
+      signal: ctrl.signal,
+    });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res || !res.ok) return null;
   const ctRaw = res.headers.get('content-type') || '';
   const ct = ctRaw.toLowerCase();
   if (ct.includes('text/html')) return null;
