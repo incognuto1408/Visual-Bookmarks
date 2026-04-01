@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Visual Bookmarks StabilityInternational",
+  "version": "2.2.0",
+  "description": "Визуальные закладки Stability International: сетка, фон, синхронизация с вашим сервером или Google Drive.",
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
+  "permissions": ["storage", "identity", "bookmarks", "history", "downloads", "sessions"],
+  "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "oauth2": {
+    "client_id": "REPLACE_WITH_YOUR_CHROME_EXTENSION_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/drive.appdata"]
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Visual Bookmarks StabilityInternational"
+  }
+}
