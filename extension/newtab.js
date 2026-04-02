@@ -27,8 +27,8 @@ function sanitizeBookmarkBackgroundColor(raw, fallback = DEFAULT_TILE_BG) {
 
 const STORAGE_KEY = 'visualBookmarks_state_v2';
 const STORAGE_KEY_LEGACY = 'visualBookmarks_state_v1';
-/** Свой фон (data URL) только локально; в основном JSON и на сервере — маркер CUSTOM_BG_MARKER */
-const STORAGE_KEY_CUSTOM_BG = 'visualBookmarks_customBg_dataUrl_v1';
+/** Одноразовая миграция: старый ключ chrome.storage (data URL) → IndexedDB, затем ключ удаляется */
+const LEGACY_CHROME_CUSTOM_BG_KEY = 'visualBookmarks_customBg_dataUrl_v1';
 /** Кэш событий календаря: 1 ч при непустом ответе, 2 мин при пустом (чтобы не «залипать» на ошибке/токене). */
 const STORAGE_KEY_CALENDAR_CACHE = 'visualBookmarks_calendar_events_cache_v2';
 const STORAGE_KEY_CALENDAR_CACHE_LEGACY = 'visualBookmarks_calendar_events_cache_v1';
@@ -37,11 +37,92 @@ const CALENDAR_EMPTY_CACHE_TTL_MS = 2 * 60 * 1000;
 const CUSTOM_BG_MARKER = '__VB_CUSTOM_BG__';
 /** Синхронное зеркало для первого кадра новой вкладки (stale-while-revalidate с chrome.storage) */
 const LOCAL_BOOT_CACHE_KEY = 'visualBookmarks_newtab_boot_v1';
-/** Data URL своего фона (если не гигантский) — мгновенно при следующем открытии */
 const LOCAL_BOOT_BG_KEY = 'visualBookmarks_newtab_boot_bg_v1';
-const MAX_BOOT_BG_STORAGE_CHARS = 2_000_000;
 const BOOT_CACHE_VERSION = 1;
 const SYNC_DEBOUNCE_MS = 2500;
+
+let pageBgObjectUrl = null;
+
+function revokePageBgObjectUrl() {
+  if (pageBgObjectUrl) {
+    try {
+      URL.revokeObjectURL(pageBgObjectUrl);
+    } catch (_) {}
+    pageBgObjectUrl = null;
+  }
+}
+
+function isCustomBackgroundMarker(bg) {
+  return !!(bg && bg.type === 'image' && bg.value === CUSTOM_BG_MARKER);
+}
+
+async function abandonCustomBackgroundBlobIfAny() {
+  revokePageBgObjectUrl();
+  if (typeof VisualBookmarksCustomBg !== 'undefined') {
+    try {
+      await VisualBookmarksCustomBg.clear();
+    } catch (_) {}
+  }
+}
+
+async function migrateAndRemoveLegacyCustomBgFromChromeStorage() {
+  return new Promise((resolve) => {
+    if (typeof storageLocal.get !== 'function') {
+      resolve();
+      return;
+    }
+    storageLocal.get([LEGACY_CHROME_CUSTOM_BG_KEY], async (res) => {
+      const d = res[LEGACY_CHROME_CUSTOM_BG_KEY];
+      if (typeof d === 'string' && d.startsWith('data:') && typeof VisualBookmarksCustomBg !== 'undefined') {
+        try {
+          await VisualBookmarksCustomBg.saveFromDataUrl(d);
+        } catch (e) {
+          console.warn('VB: миграция фона chrome.storage → IndexedDB', e);
+        }
+      }
+      if (typeof storageLocal.remove === 'function') {
+        storageLocal.remove([LEGACY_CHROME_CUSTOM_BG_KEY], () => resolve());
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+async function paintCustomBackgroundFromIdb(el) {
+  if (!el) return;
+  if (typeof VisualBookmarksCustomBg === 'undefined') {
+    el.style.backgroundColor = '#0a0a0a';
+    return;
+  }
+  try {
+    const blob = await VisualBookmarksCustomBg.loadBlob();
+    if (!blob) {
+      el.style.backgroundColor = '#0a0a0a';
+      return;
+    }
+    revokePageBgObjectUrl();
+    pageBgObjectUrl = URL.createObjectURL(blob);
+    el.style.backgroundImage = 'url("' + pageBgObjectUrl.replace(/"/g, '\\"') + '")';
+    el.style.backgroundSize = 'cover';
+    el.style.backgroundPosition = 'center';
+  } catch (e) {
+    console.warn('VB: фон из IndexedDB', e);
+    el.style.backgroundColor = '#0a0a0a';
+  }
+}
+
+async function flushTransientDataUrlBackgroundToIdbIfAny() {
+  const bg = app.settings?.background;
+  if (bg?.type !== 'image' || typeof bg.value !== 'string' || !bg.value.startsWith('data:')) return;
+  if (typeof VisualBookmarksCustomBg === 'undefined') return;
+  try {
+    await VisualBookmarksCustomBg.saveFromDataUrl(bg.value);
+    app.settings.background = { type: 'image', value: CUSTOM_BG_MARKER };
+  } catch (e) {
+    console.warn('VB: сохранение фона в IndexedDB', e);
+  }
+}
 /** Интервал между успешными синхронизациями Crypt-Chain (мс); таймер отсчитывается от `lastServerSyncAt` */
 const SERVER_PULL_INTERVAL_MS = 60 * 1000;
 
@@ -414,7 +495,7 @@ function mergeSettings(base, patch) {
 }
 
 /**
- * Для синка / API: без data URL. Свой фон — только маркер; файл в STORAGE_KEY_CUSTOM_BG.
+ * Для синка / API: без data URL. Свой фон — маркер; пиксели только в IndexedDB на устройстве.
  */
 function stripEmbeddedBackgroundForExternal(settings) {
   if (!settings || typeof settings !== 'object') return settings;
@@ -428,24 +509,18 @@ function stripEmbeddedBackgroundForExternal(settings) {
   return out;
 }
 
-/** После merge с сервером: подставить data URL из локального хранилища или дефолтный пресет */
-function hydrateCustomBackgroundIfNeeded() {
-  return new Promise((resolve) => {
-    const bg = app.settings?.background;
-    if (bg?.type !== 'image' || bg.value !== CUSTOM_BG_MARKER) {
-      resolve();
-      return;
-    }
-    storageLocal.get([STORAGE_KEY_CUSTOM_BG], (res) => {
-      const d = res[STORAGE_KEY_CUSTOM_BG];
-      if (typeof d === 'string' && d.startsWith('data:')) {
-        app.settings = mergeSettings(app.settings, { background: { type: 'image', value: d } });
-      } else {
-        app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
-      }
-      resolve();
-    });
-  });
+/** После merge с сервером: маркер «свой фон» валиден только если в IndexedDB есть файл. */
+async function hydrateCustomBackgroundIfNeeded() {
+  if (!isCustomBackgroundMarker(app.settings?.background)) return;
+  await migrateAndRemoveLegacyCustomBgFromChromeStorage();
+  if (typeof VisualBookmarksCustomBg === 'undefined') {
+    app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
+    return;
+  }
+  const blob = await VisualBookmarksCustomBg.loadBlob();
+  if (!blob) {
+    app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
+  }
 }
 
 function sortedBookmarks() {
@@ -471,49 +546,52 @@ function touchUpdated() {
 }
 
 async function loadState() {
-  return new Promise((resolve) => {
-    storageLocal.get([STORAGE_KEY, STORAGE_KEY_LEGACY, STORAGE_KEY_CUSTOM_BG], (res) => {
-      let raw = res[STORAGE_KEY];
-      if (!raw && res[STORAGE_KEY_LEGACY]) {
-        const leg = res[STORAGE_KEY_LEGACY];
-        raw = migrateLegacy(leg);
-      }
-      const customBgStored = res[STORAGE_KEY_CUSTOM_BG];
-      const customBgOk = typeof customBgStored === 'string' && customBgStored.startsWith('data:');
-
-      if (raw && typeof raw === 'object') {
-        app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, raw.settings || {});
-        app.bookmarks = Array.isArray(raw.bookmarks) ? raw.bookmarks.map(normalizeBookmark) : [];
-        app.user = raw.user || null;
-        app.updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : 0;
-        app.lastServerSyncAt =
-          typeof raw.lastServerSyncAt === 'number' && raw.lastServerSyncAt > 0 ? raw.lastServerSyncAt : null;
-
-        const b = app.settings.background;
-        if (b?.type === 'image' && typeof b.value === 'string' && b.value.startsWith('data:')) {
-          storageLocal.set({ [STORAGE_KEY_CUSTOM_BG]: b.value });
-          app.settings.background = { type: 'image', value: b.value };
-          queueMicrotask(() => void saveLocal());
-        } else if (b?.type === 'image' && b.value === CUSTOM_BG_MARKER) {
-          if (customBgOk) {
-            app.settings.background = { type: 'image', value: customBgStored };
-          } else {
-            app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
-          }
-        }
-
-        if (!app.bookmarks.length) app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
-      } else {
-        app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
-        app.settings = { ...DEFAULT_SETTINGS };
-        app.updatedAt = 0;
-        app.user = null;
-        app.lastServerSyncAt = null;
-      }
-      syncMaxBookmarksToStoredCount();
-      resolve();
-    });
+  await migrateAndRemoveLegacyCustomBgFromChromeStorage();
+  const res = await new Promise((resolve) => {
+    storageLocal.get([STORAGE_KEY, STORAGE_KEY_LEGACY], resolve);
   });
+  let raw = res[STORAGE_KEY];
+  if (!raw && res[STORAGE_KEY_LEGACY]) {
+    raw = migrateLegacy(res[STORAGE_KEY_LEGACY]);
+  }
+
+  if (raw && typeof raw === 'object') {
+    app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, raw.settings || {});
+    app.bookmarks = Array.isArray(raw.bookmarks) ? raw.bookmarks.map(normalizeBookmark) : [];
+    app.user = raw.user || null;
+    app.updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : 0;
+    app.lastServerSyncAt =
+      typeof raw.lastServerSyncAt === 'number' && raw.lastServerSyncAt > 0 ? raw.lastServerSyncAt : null;
+
+    const b = app.settings.background;
+    if (b?.type === 'image' && typeof b.value === 'string' && b.value.startsWith('data:')) {
+      if (typeof VisualBookmarksCustomBg !== 'undefined') {
+        try {
+          await VisualBookmarksCustomBg.saveFromDataUrl(b.value);
+        } catch (_) {}
+      }
+      app.settings.background = { type: 'image', value: CUSTOM_BG_MARKER };
+      await saveLocal();
+    } else if (isCustomBackgroundMarker(b)) {
+      if (typeof VisualBookmarksCustomBg !== 'undefined') {
+        const blob = await VisualBookmarksCustomBg.loadBlob();
+        if (!blob) {
+          app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
+        }
+      } else {
+        app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
+      }
+    }
+
+    if (!app.bookmarks.length) app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+  } else {
+    app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+    app.settings = { ...DEFAULT_SETTINGS };
+    app.updatedAt = 0;
+    app.user = null;
+    app.lastServerSyncAt = null;
+  }
+  syncMaxBookmarksToStoredCount();
 }
 
 /**
@@ -572,18 +650,6 @@ function tryApplyBootCache() {
   app.lastServerSyncAt =
     typeof o.lastServerSyncAt === 'number' && o.lastServerSyncAt > 0 ? o.lastServerSyncAt : null;
   syncMaxBookmarksToStoredCount();
-  try {
-    const bootBg =
-      typeof localStorage !== 'undefined' ? localStorage.getItem(LOCAL_BOOT_BG_KEY) : null;
-    if (
-      bootBg &&
-      bootBg.startsWith('data:') &&
-      app.settings.background?.type === 'image' &&
-      app.settings.background.value === CUSTOM_BG_MARKER
-    ) {
-      app.settings = mergeSettings(app.settings, { background: { type: 'image', value: bootBg } });
-    }
-  } catch (_) {}
   return true;
 }
 
@@ -636,17 +702,12 @@ function bookmarksWithoutFaviconPayload(bookmarks) {
   });
 }
 
-function saveLocal() {
-  const bg = app.settings?.background;
-  const hasCustomDataUrl =
-    bg?.type === 'image' && typeof bg.value === 'string' && bg.value.startsWith('data:');
-
+async function saveLocal() {
+  await flushTransientDataUrlBackgroundToIdbIfAny();
   const payload = {
     updatedAt: app.updatedAt,
     bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
-    settings: hasCustomDataUrl
-      ? mergeSettings(app.settings, { background: { type: 'image', value: CUSTOM_BG_MARKER } })
-      : app.settings,
+    settings: app.settings,
     user: app.user,
     lastServerSyncAt: typeof app.lastServerSyncAt === 'number' ? app.lastServerSyncAt : null,
   };
@@ -654,21 +715,11 @@ function saveLocal() {
   return new Promise((resolve) => {
     const onStored = () => {
       resolve();
-      /** JSON.stringify зеркала и большой data URL в localStorage — вне горячего пути, иначе подвисает вся вкладка. */
       scheduleWhenIdle(() => {
         try {
           writeBootCacheFromPayload(payload);
           if (typeof localStorage !== 'undefined') {
-            if (
-              hasCustomDataUrl &&
-              typeof bg.value === 'string' &&
-              bg.value.startsWith('data:') &&
-              bg.value.length <= MAX_BOOT_BG_STORAGE_CHARS
-            ) {
-              localStorage.setItem(LOCAL_BOOT_BG_KEY, bg.value);
-            } else {
-              localStorage.removeItem(LOCAL_BOOT_BG_KEY);
-            }
+            localStorage.removeItem(LOCAL_BOOT_BG_KEY);
           }
         } catch (_) {
           try {
@@ -677,20 +728,9 @@ function saveLocal() {
         }
       }, 4000);
     };
-    const writeMain = () => {
-      if (hasCustomDataUrl) {
-        storageLocal.set(
-          { [STORAGE_KEY]: payload, [STORAGE_KEY_CUSTOM_BG]: bg.value },
-          onStored
-        );
-      } else {
-        storageLocal.set({ [STORAGE_KEY]: payload }, onStored);
-      }
-    };
-    if (hasCustomDataUrl) {
-      writeMain();
-    } else if (typeof storageLocal.remove === 'function') {
-      storageLocal.remove([STORAGE_KEY_CUSTOM_BG], writeMain);
+    const writeMain = () => storageLocal.set({ [STORAGE_KEY]: payload }, onStored);
+    if (typeof storageLocal.remove === 'function') {
+      storageLocal.remove([LEGACY_CHROME_CUSTOM_BG_KEY], () => writeMain());
     } else {
       writeMain();
     }
@@ -698,10 +738,15 @@ function saveLocal() {
 }
 
 function exportJsonString() {
+  const settingsCopy = JSON.parse(JSON.stringify(app.settings));
+  const ibg = settingsCopy.background;
+  if (ibg?.type === 'image' && typeof ibg.value === 'string' && ibg.value.startsWith('data:')) {
+    settingsCopy.background = { type: 'image', value: CUSTOM_BG_MARKER };
+  }
   return JSON.stringify(
     {
       bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
-      settings: JSON.parse(JSON.stringify(app.settings)),
+      settings: settingsCopy,
       user: app.user,
       updatedAt: app.updatedAt,
       version: 2,
@@ -722,12 +767,13 @@ function importFromJson(text) {
 
 function resetDefaults() {
   clearBootCache();
+  void abandonCustomBackgroundBlobIfAny();
   app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
   app.settings = { ...DEFAULT_SETTINGS };
   app.user = null;
   app.lastServerSyncAt = null;
   if (typeof storageLocal.remove === 'function') {
-    storageLocal.remove([STORAGE_KEY_CUSTOM_BG], () => {});
+    storageLocal.remove([LEGACY_CHROME_CUSTOM_BG_KEY], () => {});
   }
   touchUpdated();
 }
@@ -775,7 +821,26 @@ function clearCryptChainSessionStorage() {
 
 async function performCryptChainLogout() {
   stopServerPeriodicPull();
+  let skipTouchAfterPush = false;
   try {
+    if (app.settings.googleCalendarEnabled) {
+      app.settings.googleCalendarEnabled = false;
+      stopCalendarRotation();
+      calendarEvents = [];
+      calendarEventIndex = 0;
+      await clearCalendarEventsCache();
+      await revokeGoogleCalendarCachedAuth();
+      touchUpdated();
+      try {
+        if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
+          await pushServerState();
+          app.lastServerSyncAt = Date.now();
+        }
+      } catch (e) {
+        console.warn('Crypt-Chain: не удалось отправить отключение календаря перед выходом:', e);
+      }
+      skipTouchAfterPush = true;
+    }
     if (typeof VisualBookmarksApi !== 'undefined' && VisualBookmarksApi.logout) {
       await VisualBookmarksApi.logout();
     }
@@ -786,14 +851,7 @@ async function performCryptChainLogout() {
   app.user = null;
   app.lastServerSyncAt = null;
   profileMenuOpen = false;
-  if (app.settings.googleCalendarEnabled) {
-    app.settings.googleCalendarEnabled = false;
-    stopCalendarRotation();
-    calendarEvents = [];
-    calendarEventIndex = 0;
-    await clearCalendarEventsCache();
-  }
-  await persist();
+  await persist(false, { skipTouchUpdated: skipTouchAfterPush });
 }
 
 /**
@@ -807,6 +865,7 @@ async function applyServerStateAfterAuth(opts = {}) {
 
   if (!isRegistration) {
     await pullServerMerge({ allowSeedPush: true });
+    scheduleCalendarRefreshAfterServerPull();
     return;
   }
 
@@ -821,9 +880,11 @@ async function applyServerStateAfterAuth(opts = {}) {
     app.lastServerSyncAt = Date.now();
     await saveLocal();
     renderAll();
+    scheduleCalendarRefreshAfterServerPull();
     return;
   }
   await pullServerMerge({ allowSeedPush: true });
+  scheduleCalendarRefreshAfterServerPull();
 }
 
 /**
@@ -957,7 +1018,8 @@ async function runServerPeriodicPullTick() {
       stopServerPeriodicPull();
       return;
     }
-    await pullServerMerge({ allowSeedPush: false });
+    const merged = await pullServerMerge({ allowSeedPush: false });
+    if (merged) scheduleCalendarRefreshAfterServerPull();
     await restartServerPeriodicPull();
   } catch (e) {
     console.warn('Periodic server sync:', e);
@@ -973,16 +1035,23 @@ async function restartServerPeriodicPull() {
   stopServerPeriodicPull();
 }
 
+/** После любого pull с сервера — перечитать флаг календаря и при необходимости события (другой ПК мог изменить настройки). */
+function scheduleCalendarRefreshAfterServerPull() {
+  scheduleWhenIdle(() => void refreshCalendarEvents({ force: true }));
+}
+
 /** @returns {Promise<boolean>} нужен ли полный renderAll снаружи */
 async function pullRemoteMerge() {
+  let merged = false;
   try {
     if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
-      return await pullServerMerge();
+      merged = await pullServerMerge();
     }
   } catch (e) {
     console.warn('Server sync:', e);
   }
-  return false;
+  scheduleCalendarRefreshAfterServerPull();
+  return merged;
 }
 
 /** Один проход: Crypt-Chain при активной сессии. Без ожидания из UI. */
@@ -1013,9 +1082,10 @@ function debounce(fn, ms) {
 /**
  * Локально: сразу сохраняет и перерисовывает. Сеть (Crypt-Chain) — только в фоне, без блокировки UI.
  * @param {boolean} [immediateServerPush] — поставить фоновую отправку сразу (иначе debounce 2,5 с).
+ * @param {{ skipTouchUpdated?: boolean }} [opts] — не вызывать touchUpdated (например после push с тем же updatedAt при выходе).
  */
-async function persist(immediateServerPush = false) {
-  touchUpdated();
+async function persist(immediateServerPush = false, opts = {}) {
+  if (!opts.skipTouchUpdated) touchUpdated();
   await saveLocal();
   renderAll();
   renderSettingsIfOpen();
@@ -1037,6 +1107,9 @@ function applyTheme() {
 function pickDailyPreset() {
   const day = new Date().toDateString();
   if (app.settings._lastBgDay === day && app.settings.changeBgDaily) return;
+  if (isCustomBackgroundMarker(app.settings.background)) {
+    void abandonCustomBackgroundBlobIfAny();
+  }
   const idx = Math.floor(Date.now() / 86400000) % PRESET_BACKGROUNDS.length;
   app.settings.background = { type: 'preset', value: PRESET_BACKGROUNDS[idx].value };
   app.settings._lastBgDay = day;
@@ -1083,6 +1156,41 @@ function clearCalendarEventsCache() {
     } else {
       resolve();
     }
+  });
+}
+
+/** Сбрасывает кэш OAuth Google в расширении — при следующем подключении календаря снова откроется выбор аккаунта. */
+function revokeGoogleCalendarCachedAuth() {
+  return new Promise((resolve) => {
+    if (typeof chrome === 'undefined' || !chrome.identity) {
+      resolve();
+      return;
+    }
+    if (typeof chrome.identity.clearAllCachedAuthTokens === 'function') {
+      chrome.identity.clearAllCachedAuthTokens(() => {
+        void chrome.runtime?.lastError;
+        resolve();
+      });
+      return;
+    }
+    if (typeof chrome.identity.getAuthToken !== 'function') {
+      resolve();
+      return;
+    }
+    chrome.identity.getAuthToken({ interactive: false }, (token) => {
+      if (chrome.runtime.lastError || !token) {
+        resolve();
+        return;
+      }
+      if (typeof chrome.identity.removeCachedAuthToken === 'function') {
+        chrome.identity.removeCachedAuthToken({ token }, () => {
+          void chrome.runtime?.lastError;
+          resolve();
+        });
+      } else {
+        resolve();
+      }
+    });
   });
 }
 
@@ -1281,7 +1389,7 @@ async function connectGoogleCalendar() {
       );
     });
     await yieldToPaint();
-    await persist();
+    await persist(true);
     renderSettingsIfOpen();
   };
 
@@ -1391,15 +1499,26 @@ function applyBackground() {
   el.style.backgroundColor = '';
   el.style.background = '';
   if (bg.type === 'color') {
+    revokePageBgObjectUrl();
     if (String(bg.value).startsWith('linear')) el.style.background = bg.value;
     else el.style.backgroundColor = bg.value;
   } else if (bg.type === 'image' || bg.type === 'preset') {
     const v = String(bg.value || '');
-    // Маркер синка без локального data URL — не подставлять в url(), иначе chrome-extension://…/__VB_CUSTOM_BG__
-    if (
-      bg.type === 'image' &&
-      (v === CUSTOM_BG_MARKER || (!v.startsWith('data:') && !/^https?:\/\//i.test(v)))
-    ) {
+    if (isCustomBackgroundMarker(bg)) {
+      revokePageBgObjectUrl();
+      el.style.backgroundColor = '#0a0a0a';
+      void paintCustomBackgroundFromIdb(el);
+      return;
+    }
+    if (bg.type === 'image' && v.startsWith('data:')) {
+      revokePageBgObjectUrl();
+      el.style.backgroundImage = 'url("' + v.replace(/"/g, '\\"') + '")';
+      el.style.backgroundSize = 'cover';
+      el.style.backgroundPosition = 'center';
+      return;
+    }
+    revokePageBgObjectUrl();
+    if (bg.type === 'image' && !v.startsWith('data:') && !/^https?:\/\//i.test(v)) {
       el.style.backgroundColor = '#0a0a0a';
       return;
     }
@@ -1407,6 +1526,7 @@ function applyBackground() {
     el.style.backgroundSize = 'cover';
     el.style.backgroundPosition = 'center';
   } else {
+    revokePageBgObjectUrl();
     el.style.backgroundColor = '#0a0a0a';
   }
 }
@@ -2153,7 +2273,7 @@ function renderSettingsPanels() {
     (s.showCalendar !== false
       ? '<section class="mb-6">' +
         '<h2 class="settings-section-title">Google Календарь</h2>' +
-        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">События на сегодня из основного календаря (primary). OAuth через <code style="font-size:0.75rem">chrome.identity</code>, scope <code style="font-size:0.75rem">calendar.readonly</code> в manifest. В консоли Google Cloud включите <strong>Google Calendar API</strong>.</p>' +
+        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">События на сегодня из основного календаря (primary). Включение/выключение сохраняется в аккаунте Crypt-Chain вместе с настройками — на другом компьютере после входа состояние подтянется; токен Google остаётся в Chrome на каждом устройстве, при необходимости один раз подтвердите доступ. OAuth: <code style="font-size:0.75rem">chrome.identity</code>, scope <code style="font-size:0.75rem">calendar.readonly</code>. В Google Cloud включите <strong>Google Calendar API</strong>.</p>' +
         '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem">' +
         (s.googleCalendarEnabled
           ? '<span class="settings-calendar-status settings-calendar-status--ok">Календарь подключен</span>' +
@@ -2270,7 +2390,10 @@ function wireSettingsAppearance(totalPages) {
     }
   });
   document.querySelectorAll('[data-bg-preset]').forEach((b) => {
-    b.addEventListener('click', () => {
+    b.addEventListener('click', async () => {
+      if (isCustomBackgroundMarker(app.settings.background)) {
+        await abandonCustomBackgroundBlobIfAny();
+      }
       app.settings.background = { type: 'preset', value: b.getAttribute('data-bg-preset') };
       persist();
       renderSettingsIfOpen();
@@ -2315,12 +2438,13 @@ function wireSettingsAppearance(totalPages) {
       app.settings.googleCalendarEnabled = false;
       stopCalendarRotation();
       calendarEvents = [];
-      void clearCalendarEventsCache().then(() =>
-        persist().then(() => {
-          renderSettingsIfOpen();
-          renderCalendarWidget();
-        })
-      );
+      void (async () => {
+        await clearCalendarEventsCache();
+        await revokeGoogleCalendarCachedAuth();
+        await persist(true);
+        renderSettingsIfOpen();
+        renderCalendarWidget();
+      })();
     });
   }
   document.querySelectorAll('[data-engine-pick]').forEach((b) => {
@@ -2392,6 +2516,7 @@ function wireSettingsSystem() {
     st.textContent = 'Синхронизация…';
     try {
       await pullServerMerge({ allowSeedPush: true });
+      scheduleCalendarRefreshAfterServerPull();
       st.textContent = 'Синхронизация выполнена, ' + new Date().toLocaleTimeString();
     } catch (e) {
       st.textContent = e.message || String(e);
@@ -2621,6 +2746,7 @@ async function init() {
         })
       : Promise.resolve(),
   ]);
+  await hydrateCustomBackgroundIfNeeded();
   if (cryptSession.hasToken && cryptSession.user) {
     if (app.user == null) {
       app.user = normalizeServerUser(cryptSession.user);
@@ -2866,17 +2992,28 @@ async function init() {
     }
   });
 
-  $('hiddenBgFile').addEventListener('change', () => {
+  $('hiddenBgFile').addEventListener('change', async () => {
     const f = $('hiddenBgFile').files?.[0];
     $('hiddenBgFile').value = '';
     if (!f) return;
-    const r = new FileReader();
-    r.onload = () => {
-      app.settings.background = { type: 'image', value: r.result };
-      persist();
+    if (typeof VisualBookmarksCustomBg === 'undefined') {
+      alert('Не загружен custom-background-idb.js');
+      return;
+    }
+    try {
+      await VisualBookmarksCustomBg.saveBlob(f);
+      app.settings.background = { type: 'image', value: CUSTOM_BG_MARKER };
+      revokePageBgObjectUrl();
+      pageBgObjectUrl = URL.createObjectURL(f);
+      const el = $('pageBg');
+      el.style.backgroundImage = 'url("' + pageBgObjectUrl.replace(/"/g, '\\"') + '")';
+      el.style.backgroundSize = 'cover';
+      el.style.backgroundPosition = 'center';
+      await persist();
       renderSettingsIfOpen();
-    };
-    r.readAsDataURL(f);
+    } catch (e) {
+      alert((e && e.message) || String(e));
+    }
   });
 
   $('hiddenImportFile').addEventListener('change', () => {
@@ -2886,6 +3023,16 @@ async function init() {
     f.text().then(async (text) => {
       try {
         importFromJson(text);
+        const ibg = app.settings.background;
+        if (
+          ibg?.type === 'image' &&
+          typeof ibg.value === 'string' &&
+          ibg.value.startsWith('data:') &&
+          typeof VisualBookmarksCustomBg !== 'undefined'
+        ) {
+          await VisualBookmarksCustomBg.saveFromDataUrl(ibg.value);
+          app.settings.background = { type: 'image', value: CUSTOM_BG_MARKER };
+        }
         await hydrateCustomBackgroundIfNeeded();
         await persist(true);
         hideModal('modalSettings');
@@ -2955,7 +3102,6 @@ async function init() {
     } catch (_) {}
   });
 
-  scheduleWhenIdle(() => void refreshCalendarEvents());
   scheduleWhenIdle(() => {
     void (async () => {
       try {
