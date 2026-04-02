@@ -1312,6 +1312,68 @@ async function refreshCalendarEventsInPage(dayKey, pageOpts = {}) {
   }
 }
 
+/** Service worker ещё не поднял listener (сон MV3) — lastError от sendMessage */
+function isServiceWorkerNotReceivingError(msg) {
+  const m = String(msg || '');
+  return (
+    m.includes('Receiving end does not exist') ||
+    m.includes('Could not establish connection') ||
+    m.includes('The message port closed before a response was received')
+  );
+}
+
+function pingCalendarServiceWorkerWake() {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome.runtime?.sendMessage) {
+        resolve();
+        return;
+      }
+      chrome.runtime.sendMessage({ type: 'VB_CALENDAR_SW_WAKE' }, () => {
+        void chrome.runtime?.lastError;
+        resolve();
+      });
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function sendCalendarTodayToServiceWorkerOnce() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: 'VB_CALENDAR_TODAY' }, (r) => {
+        if (chrome.runtime.lastError) {
+          resolve({
+            ok: false,
+            events: [],
+            error: chrome.runtime.lastError.message,
+          });
+          return;
+        }
+        resolve(r && typeof r === 'object' ? r : { ok: false, events: [] });
+      });
+    } catch (e) {
+      resolve({ ok: false, events: [], error: String(e) });
+    }
+  });
+}
+
+/** Несколько попыток: SW в MV3 часто не слушает сразу после открытия вкладки */
+async function fetchCalendarTodayViaServiceWorker() {
+  let resp = await sendCalendarTodayToServiceWorkerOnce();
+  if (resp.ok) return resp;
+  if (!isServiceWorkerNotReceivingError(resp.error)) return resp;
+  await pingCalendarServiceWorkerWake();
+  await new Promise((r) => setTimeout(r, 80));
+  resp = await sendCalendarTodayToServiceWorkerOnce();
+  if (resp.ok) return resp;
+  if (!isServiceWorkerNotReceivingError(resp.error)) return resp;
+  await new Promise((r) => setTimeout(r, 250));
+  resp = await sendCalendarTodayToServiceWorkerOnce();
+  return resp;
+}
+
 /**
  * До первого renderAll: подставить события из chrome.storage за текущий календарный день (без проверки TTL).
  */
@@ -1374,23 +1436,7 @@ async function refreshCalendarEvents(opts = {}) {
   await new Promise((r) => setTimeout(r, 0));
 
   if (isExtensionContext() && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
-    const resp = await new Promise((resolve) => {
-      try {
-        chrome.runtime.sendMessage({ type: 'VB_CALENDAR_TODAY' }, (r) => {
-          if (chrome.runtime.lastError) {
-            resolve({
-              ok: false,
-              events: [],
-              error: chrome.runtime.lastError.message,
-            });
-            return;
-          }
-          resolve(r && typeof r === 'object' ? r : { ok: false, events: [] });
-        });
-      } catch (e) {
-        resolve({ ok: false, events: [], error: String(e) });
-      }
-    });
+    const resp = await fetchCalendarTodayViaServiceWorker();
     if (resp.ok && Array.isArray(resp.events)) {
       await new Promise((resolve) => {
         storageLocal.set(
@@ -1401,7 +1447,9 @@ async function refreshCalendarEvents(opts = {}) {
       applyCalendarResult(resp.events);
       return;
     }
-    console.warn('Google Calendar (фон):', resp.error || 'нет ответа');
+    if (!isServiceWorkerNotReceivingError(resp.error)) {
+      console.warn('Google Calendar (фон):', resp.error || 'нет ответа');
+    }
     if (
       cached &&
       cached.dayKey === dayKey &&
