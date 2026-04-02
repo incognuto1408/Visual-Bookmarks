@@ -941,6 +941,11 @@ body {
   z-index: 60;
 }
 
+/* Выше #modalSettings (55), иначе клики по «Подключить» в календаре уходят в настройки */
+#modalCalendarConnect {
+  z-index: 65;
+}
+
 .modal {
   position: fixed;
   inset: 0;

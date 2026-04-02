@@ -215,6 +215,11 @@ let calendarEventIndex = 0;
 let calendarRotateTimer = null;
 /** Повторный клик «Подключить календарь», пока ждём service worker / OAuth */
 let calendarConnectInFlight = false;
+/** Логи в консоли new tab: фильтр по строке `[VB Calendar]` */
+const VB_CALENDAR_DEBUG = true;
+function logCalendarConnect(...args) {
+  if (VB_CALENDAR_DEBUG) console.info('[VB Calendar]', ...args);
+}
 
 const $ = (id) => {
   const el = document.getElementById(id);
@@ -1301,11 +1306,16 @@ async function refreshCalendarEvents(opts = {}) {
 }
 
 async function connectGoogleCalendar() {
+  logCalendarConnect('connectGoogleCalendar() вызван');
   if (typeof VisualBookmarksCalendar === 'undefined') {
+    console.warn('[VB Calendar] VisualBookmarksCalendar не определён (проверьте google-calendar.js в newtab.html)');
     alert('Модуль календаря не загружен (файл google-calendar.js).');
     return;
   }
-  if (calendarConnectInFlight) return;
+  if (calendarConnectInFlight) {
+    logCalendarConnect('пропуск: уже идёт подключение (calendarConnectInFlight)');
+    return;
+  }
   calendarConnectInFlight = true;
   const calModalBtn = document.getElementById('btnCalendarModalConnect');
   const calSettingsBtn = document.getElementById('btnCalendarSettingsConnect');
@@ -1338,39 +1348,29 @@ async function connectGoogleCalendar() {
     await yieldToPaint();
     await new Promise((r) => setTimeout(r, 0));
     if (isExtensionContext() && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
-      const resp = await new Promise((resolve) => {
-        try {
-          chrome.runtime.sendMessage({ type: 'VB_CALENDAR_CONNECT' }, (r) => {
-            if (chrome.runtime.lastError) {
-              resolve({
-                ok: false,
-                events: [],
-                error: chrome.runtime.lastError.message,
-              });
-              return;
-            }
-            resolve(r && typeof r === 'object' ? r : { ok: false, events: [], error: 'нет ответа' });
-          });
-        } catch (e) {
-          resolve({ ok: false, events: [], error: String(e) });
-        }
-      });
+      logCalendarConnect('контекст расширения OK, ждём worker…');
+      const resp = await sendCalendarConnectToWorker();
       if (resp.ok) {
+        logCalendarConnect('успех, finishOk, событий:', Array.isArray(resp.events) ? resp.events.length : 0);
         await finishOk(resp.events);
         return;
       }
+      console.warn('[VB Calendar] worker вернул ошибку:', resp.error);
       alert(resp.error || 'Не удалось подключить календарь');
       return;
     }
 
+    logCalendarConnect('fallback: подключение на странице (нет sendMessage)');
     const token = await VisualBookmarksCalendar.getAuthToken(true);
     if (!token) throw new Error('Токен не получен');
     const events = await VisualBookmarksCalendar.fetchTodayEvents(token);
     await finishOk(events);
   } catch (e) {
+    console.warn('[VB Calendar] connectGoogleCalendar catch:', e);
     alert((e && e.message) || String(e));
   } finally {
     calendarConnectInFlight = false;
+    logCalendarConnect('finally: сняты disabled / aria-busy с кнопок');
     [calModalBtn, calSettingsBtn].forEach((b) => {
       if (b) {
         b.disabled = false;
@@ -2387,7 +2387,12 @@ function wireSettingsAppearance(totalPages) {
     });
   });
   const btnCalConn = document.getElementById('btnCalendarSettingsConnect');
-  if (btnCalConn) btnCalConn.addEventListener('click', () => showModal('modalCalendarConnect'));
+  if (btnCalConn) {
+    btnCalConn.addEventListener('click', () => {
+      hideModal('modalSettings');
+      showModal('modalCalendarConnect');
+    });
+  }
   const btnCalDis = document.getElementById('btnCalendarSettingsDisconnect');
   if (btnCalDis) {
     btnCalDis.addEventListener('click', () => {
@@ -2570,6 +2575,15 @@ function showModal(id) {
   const m = $(id);
   m.classList.remove('is-hidden');
   m.hidden = false;
+  if (id === 'modalCalendarConnect') {
+    calendarConnectInFlight = false;
+    const b = document.getElementById('btnCalendarModalConnect');
+    if (b) {
+      b.disabled = false;
+      b.removeAttribute('aria-busy');
+    }
+    logCalendarConnect('модалка календаря открыта: сброшены inFlight и кнопка (на случай зависшего прошлого запуска)');
+  }
 }
 
 function hideModal(id) {
@@ -2774,6 +2788,50 @@ function yieldToPaint() {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => resolve());
     });
+  });
+}
+
+/** VB_CALENDAR_CONNECT с таймаутом: иначе callback иногда не вызывается и кнопка остаётся disabled. */
+function sendCalendarConnectToWorker(timeoutMs = 180000) {
+  return new Promise((resolve) => {
+    logCalendarConnect('отправка VB_CALENDAR_CONNECT в service worker (таймаут', timeoutMs / 1000, 'с)…');
+    const t = setTimeout(() => {
+      console.warn(
+        '[VB Calendar]',
+        'таймаут: нет ответа worker за',
+        timeoutMs / 1000,
+        'с. Откройте chrome://extensions → «Проверить вид» у service worker и смотрите консоль [VB Calendar SW]'
+      );
+      resolve({
+        ok: false,
+        events: [],
+        error:
+          'Нет ответа от service worker. Откройте chrome://extensions, нажмите «service worker» → Inspect, повторите подключение.',
+      });
+    }, timeoutMs);
+    try {
+      chrome.runtime.sendMessage({ type: 'VB_CALENDAR_CONNECT' }, (r) => {
+        clearTimeout(t);
+        if (chrome.runtime.lastError) {
+          console.warn('[VB Calendar] chrome.runtime.lastError:', chrome.runtime.lastError.message);
+          resolve({
+            ok: false,
+            events: [],
+            error: chrome.runtime.lastError.message,
+          });
+          return;
+        }
+        logCalendarConnect(
+          'ответ worker:',
+          r && typeof r === 'object' ? { ok: r.ok, error: r.error, eventsCount: Array.isArray(r.events) ? r.events.length : '—' } : r
+        );
+        resolve(r && typeof r === 'object' ? r : { ok: false, events: [], error: 'нет ответа' });
+      });
+    } catch (err) {
+      clearTimeout(t);
+      console.warn('[VB Calendar] sendMessage throw:', err);
+      resolve({ ok: false, events: [], error: String(err) });
+    }
   });
 }
 
@@ -3102,7 +3160,17 @@ async function init() {
     if (app.settings.theme === 'auto') renderAll();
   });
 
-  $('btnCalendarModalConnect')?.addEventListener('click', () => void connectGoogleCalendar());
+  {
+    const calBtn = document.getElementById('btnCalendarModalConnect');
+    if (calBtn) {
+      calBtn.addEventListener('click', () => {
+        logCalendarConnect('клик #btnCalendarModalConnect');
+        void connectGoogleCalendar();
+      });
+    } else {
+      console.warn('[VB Calendar] при init не найден #btnCalendarModalConnect — обработчик не навешан');
+    }
+  }
 
   scheduleWhenIdle(() => {
     try {

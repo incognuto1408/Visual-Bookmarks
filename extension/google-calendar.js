@@ -2,6 +2,9 @@
  * Google Calendar API для расширения (chrome.identity + Calendar API readonly).
  * Требует в manifest.json scope https://www.googleapis.com/auth/calendar.readonly
  * и включённый Google Calendar API в Google Cloud Console.
+ *
+ * Тот же код встроен в background.js (service worker): importScripts() к этому файлу
+ * в MV3 даёт DOMException у части сборок Chrome — не удаляйте расхождение без проверки SW.
  */
 (function (global) {
   const CALENDAR_LIST_URL = 'https://www.googleapis.com/calendar/v3/users/me/calendarList';
