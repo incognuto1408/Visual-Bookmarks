@@ -389,6 +389,104 @@ function isProbablyHtmlBody(buf) {
 
 const FAVICON_FETCH_MS = 8000;
 
+/** Кэш favicon между сессиями: один успешный ответ на origin, «промах» не перезапрашиваем до TTL */
+const FAVICON_STORAGE_KEY = 'visualBookmarks_favicon_cache_v1';
+/** Общая квота chrome.storage.local ~10 MB на всё расширение — не забиваем основной JSON закладок */
+const FAVICON_MAX_ENTRIES = 45;
+const FAVICON_MAX_CACHE_PAYLOAD_BYTES = 1.5 * 1024 * 1024;
+/** Не кладём в один объект слишком тяжёлый data URL */
+const FAVICON_MAX_STORED_DATA_URL_LEN = 56 * 1024;
+const FAVICON_MISS_RETRY_MS = 3 * 24 * 60 * 60 * 1000;
+
+const faviconMemoryResult = new Map();
+const faviconInFlight = new Map();
+
+function faviconOriginKey(pageUrl) {
+  try {
+    const u = new URL(pageUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    return u.origin;
+  } catch {
+    return '';
+  }
+}
+
+function readFaviconCacheFromStorage() {
+  return new Promise((resolve) => {
+    if (typeof chrome === 'undefined' || !chrome.storage?.local?.get) {
+      resolve({});
+      return;
+    }
+    chrome.storage.local.get(FAVICON_STORAGE_KEY, (o) => {
+      const v = o && o[FAVICON_STORAGE_KEY];
+      resolve(v && typeof v === 'object' ? v : {});
+    });
+  });
+}
+
+function faviconEntryApproxBytes(entry) {
+  if (!entry || typeof entry !== 'object') return 16;
+  let n = 48;
+  if (typeof entry.dataUrl === 'string') n += entry.dataUrl.length;
+  if (typeof entry.verifiedUrl === 'string') n += entry.verifiedUrl.length;
+  return n;
+}
+
+function faviconCacheTotalBytes(cache) {
+  return Object.keys(cache).reduce((s, k) => s + faviconEntryApproxBytes(cache[k]), 0);
+}
+
+function pruneFaviconCacheObject(cache) {
+  let list = Object.keys(cache).sort((a, b) => (cache[a].at || 0) - (cache[b].at || 0));
+  let guard = 0;
+  while (
+    list.length > 0 &&
+    (list.length > FAVICON_MAX_ENTRIES || faviconCacheTotalBytes(cache) > FAVICON_MAX_CACHE_PAYLOAD_BYTES) &&
+    guard < 500
+  ) {
+    delete cache[list[0]];
+    guard++;
+    list = Object.keys(cache).sort((a, b) => (cache[a].at || 0) - (cache[b].at || 0));
+  }
+  return cache;
+}
+
+async function persistFaviconCacheMerge(origin, partial) {
+  const cache = await readFaviconCacheFromStorage();
+  const at = partial.at != null ? partial.at : Date.now();
+  if (partial.miss === true) {
+    cache[origin] = { miss: true, at };
+  } else {
+    cache[origin] = {
+      dataUrl: partial.dataUrl,
+      verifiedUrl: partial.verifiedUrl || '',
+      at,
+    };
+  }
+  pruneFaviconCacheObject(cache);
+  if (typeof chrome === 'undefined' || !chrome.storage?.local?.set) return;
+  await new Promise((resolve) => {
+    chrome.storage.local.set({ [FAVICON_STORAGE_KEY]: cache }, () => {
+      if (chrome.runtime.lastError) {
+        const msg = chrome.runtime.lastError.message || '';
+        console.warn('[VB Favicon] storage.set:', msg);
+        const half = Object.keys(cache).sort((a, b) => (cache[a].at || 0) - (cache[b].at || 0));
+        const mid = Math.floor(half.length / 2);
+        for (let i = 0; i < mid; i++) delete cache[half[i]];
+        pruneFaviconCacheObject(cache);
+        chrome.storage.local.set({ [FAVICON_STORAGE_KEY]: cache }, () => {
+          if (chrome.runtime.lastError) {
+            console.error('[VB Favicon] storage.set retry:', chrome.runtime.lastError.message);
+          }
+          resolve();
+        });
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
 async function tryFetchVerifiedFavicon(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), FAVICON_FETCH_MS);
@@ -435,6 +533,71 @@ function faviconUrlsToTry(pageUrl) {
   return [o + '/favicon.ico', o + '/favicon.png'];
 }
 
+/**
+ * Один сетевой проход на origin: память SW + chrome.storage.local, single-flight.
+ */
+function getOrFetchFavicon(pageUrl) {
+  const origin = faviconOriginKey(pageUrl);
+  if (!origin) return Promise.resolve({ ok: false });
+
+  if (faviconMemoryResult.has(origin)) {
+    return Promise.resolve(faviconMemoryResult.get(origin));
+  }
+
+  let p = faviconInFlight.get(origin);
+  if (!p) {
+    p = (async () => {
+      const disk = await readFaviconCacheFromStorage();
+      const ent = disk[origin];
+      if (ent && ent.dataUrl && typeof ent.dataUrl === 'string') {
+        if (ent.dataUrl.length <= FAVICON_MAX_STORED_DATA_URL_LEN) {
+          return { ok: true, dataUrl: ent.dataUrl, verifiedUrl: ent.verifiedUrl || '' };
+        }
+      }
+      if (ent && ent.miss === true && Date.now() - (ent.at || 0) < FAVICON_MISS_RETRY_MS) {
+        return { ok: false };
+      }
+
+      const urls = faviconUrlsToTry(pageUrl);
+      if (!urls.length) return { ok: false };
+
+      let dataUrl = null;
+      let verifiedUrl = null;
+      for (const u of urls) {
+        try {
+          const d = await tryFetchVerifiedFavicon(u);
+          if (d) {
+            dataUrl = d;
+            verifiedUrl = u;
+            break;
+          }
+        } catch {
+          /* следующий путь */
+        }
+      }
+
+      if (dataUrl) {
+        if (dataUrl.length <= FAVICON_MAX_STORED_DATA_URL_LEN) {
+          await persistFaviconCacheMerge(origin, { dataUrl, verifiedUrl });
+        }
+        return { ok: true, dataUrl, verifiedUrl };
+      }
+
+      await persistFaviconCacheMerge(origin, { miss: true });
+      return { ok: false };
+    })()
+      .then((r) => {
+        faviconMemoryResult.set(origin, r);
+        return r;
+      })
+      .finally(() => {
+        faviconInFlight.delete(origin);
+      });
+    faviconInFlight.set(origin, p);
+  }
+  return p;
+}
+
 chrome.runtime.onInstalled.addListener(() => {});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -459,24 +622,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message?.type !== 'VB_GET_FAVICON') return false;
-  (async () => {
-    const urls = faviconUrlsToTry(message.pageUrl);
-    if (!urls.length) {
-      sendResponse({ ok: false });
-      return;
+  void getOrFetchFavicon(message.pageUrl).then((r) => {
+    try {
+      sendResponse(r);
+    } catch (e) {
+      console.warn('[VB Favicon] sendResponse:', e?.message || e);
     }
-    for (const u of urls) {
-      try {
-        const dataUrl = await tryFetchVerifiedFavicon(u);
-        if (dataUrl) {
-          sendResponse({ ok: true, dataUrl, verifiedUrl: u });
-          return;
-        }
-      } catch {
-        /* сеть / DNS — следующий путь */
-      }
-    }
-    sendResponse({ ok: false });
-  })();
+  });
   return true;
 });

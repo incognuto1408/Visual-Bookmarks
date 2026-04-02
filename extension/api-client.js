@@ -15,7 +15,20 @@
   function storageGet(keys) {
     return new Promise((resolve) => {
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        chrome.storage.local.get(keys, resolve);
+        let done = false;
+        const finish = (out) => {
+          if (done) return;
+          done = true;
+          resolve(out && typeof out === 'object' ? out : {});
+        };
+        const timer = setTimeout(() => {
+          console.warn('[VB API] chrome.storage.local.get timeout', keys);
+          finish({});
+        }, 10000);
+        chrome.storage.local.get(keys, (out) => {
+          clearTimeout(timer);
+          finish(out);
+        });
         return;
       }
       const out = {};
