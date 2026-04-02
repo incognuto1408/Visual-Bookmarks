@@ -533,8 +533,27 @@ function faviconUrlsToTry(pageUrl) {
   return [o + '/favicon.ico', o + '/favicon.png'];
 }
 
+/** Запасные источники по домену (Gmail и др. часто без отдачи /favicon.ico расширению). */
+function externalFallbackFaviconUrls(pageUrl) {
+  let u;
+  try {
+    u = new URL(pageUrl);
+  } catch {
+    return [];
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return [];
+  const host = u.hostname;
+  if (!host) return [];
+  const dom = host.replace(/^www\./i, '');
+  return [
+    'https://www.google.com/s2/favicons?sz=64&domain=' + encodeURIComponent(dom),
+    'https://icons.duckduckgo.com/ip3/' + encodeURIComponent(host) + '.ico',
+  ];
+}
+
 /**
  * Один сетевой проход на origin: память SW + chrome.storage.local, single-flight.
+ * В памяти SW храним только успешные ответы — иначе после одной неудачи иконки не обновлялись до перезапуска worker.
  */
 function getOrFetchFavicon(pageUrl) {
   const origin = faviconOriginKey(pageUrl);
@@ -554,25 +573,40 @@ function getOrFetchFavicon(pageUrl) {
           return { ok: true, dataUrl: ent.dataUrl, verifiedUrl: ent.verifiedUrl || '' };
         }
       }
-      if (ent && ent.miss === true && Date.now() - (ent.at || 0) < FAVICON_MISS_RETRY_MS) {
-        return { ok: false };
-      }
 
-      const urls = faviconUrlsToTry(pageUrl);
-      if (!urls.length) return { ok: false };
+      const missFresh =
+        ent && ent.miss === true && Date.now() - (ent.at || 0) < FAVICON_MISS_RETRY_MS;
 
       let dataUrl = null;
       let verifiedUrl = null;
-      for (const u of urls) {
-        try {
-          const d = await tryFetchVerifiedFavicon(u);
-          if (d) {
-            dataUrl = d;
-            verifiedUrl = u;
-            break;
+
+      if (!missFresh) {
+        for (const u of faviconUrlsToTry(pageUrl)) {
+          try {
+            const d = await tryFetchVerifiedFavicon(u);
+            if (d) {
+              dataUrl = d;
+              verifiedUrl = u;
+              break;
+            }
+          } catch {
+            /* следующий путь */
           }
-        } catch {
-          /* следующий путь */
+        }
+      }
+
+      if (!dataUrl) {
+        for (const u of externalFallbackFaviconUrls(pageUrl)) {
+          try {
+            const d = await tryFetchVerifiedFavicon(u);
+            if (d) {
+              dataUrl = d;
+              verifiedUrl = u;
+              break;
+            }
+          } catch {
+            /* следующий */
+          }
         }
       }
 
@@ -587,7 +621,9 @@ function getOrFetchFavicon(pageUrl) {
       return { ok: false };
     })()
       .then((r) => {
-        faviconMemoryResult.set(origin, r);
+        if (r && r.ok && r.dataUrl) {
+          faviconMemoryResult.set(origin, r);
+        }
         return r;
       })
       .finally(() => {

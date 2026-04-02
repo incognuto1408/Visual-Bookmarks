@@ -29,6 +29,8 @@ const STORAGE_KEY = 'visualBookmarks_state_v2';
 const STORAGE_KEY_LEGACY = 'visualBookmarks_state_v1';
 /** Кэш иконок в background.js; при QUOTA очищаем, чтобы снова сохранялись закладки (тот же ключ, что в background.js). */
 const FAVICON_CACHE_STORAGE_KEY = 'visualBookmarks_favicon_cache_v1';
+/** Как в background.js — не подставляем из storage слишком тяжёлые data URL */
+const FAVICON_MAX_STORED_DATA_URL_LEN = 56 * 1024;
 /** Одноразовая миграция: старый ключ chrome.storage (data URL) → IndexedDB, затем ключ удаляется */
 const LEGACY_CHROME_CUSTOM_BG_KEY = 'visualBookmarks_customBg_dataUrl_v1';
 /** Кэш событий календаря: 1 ч при непустом ответе, 2 мин при пустом (чтобы не «залипать» на ошибке/токене). */
@@ -622,15 +624,68 @@ function getFaviconViaBackground(pageUrl) {
 }
 
 const vbFaviconSessionCache = new Map();
+/** После неудачи не спамить service worker до истечения (успехи только в vbFaviconSessionCache) */
+const vbFaviconFailUntil = new Map();
+const VB_FAVICON_FAIL_COOLDOWN_MS = 120000;
 
-/** Тот же запрос к SW, но один раз на URL за сессию вкладки (без хранения в JSON) */
+/**
+ * Перед первым render: подтянуть уже сохранённые в chrome.storage.local иконки (по origin закладки).
+ * Без этого при каждой перезагрузке new tab кэш вкладки пустой — снова earth и сетевые запросы.
+ */
+async function warmFaviconSessionCacheFromStorage() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.local?.get) return;
+  try {
+    const disk = await new Promise((resolve) => {
+      chrome.storage.local.get(FAVICON_CACHE_STORAGE_KEY, (o) => {
+        if (chrome.runtime.lastError) {
+          resolve({});
+          return;
+        }
+        const v = o && o[FAVICON_CACHE_STORAGE_KEY];
+        resolve(v && typeof v === 'object' ? v : {});
+      });
+    });
+    for (const b of app.bookmarks || []) {
+      const u = String(b.url || '').trim();
+      if (!u || !/^https?:\/\//i.test(u)) continue;
+      let origin;
+      try {
+        origin = new URL(u).origin;
+      } catch {
+        continue;
+      }
+      const ent = disk[origin];
+      if (
+        ent &&
+        ent.dataUrl &&
+        typeof ent.dataUrl === 'string' &&
+        ent.dataUrl.startsWith('data:') &&
+        ent.dataUrl.length <= FAVICON_MAX_STORED_DATA_URL_LEN
+      ) {
+        vbFaviconSessionCache.set(u, { ok: true, dataUrl: ent.dataUrl });
+        vbFaviconFailUntil.delete(u);
+      }
+    }
+  } catch (e) {
+    console.warn('[VB] warmFaviconSessionCacheFromStorage:', e);
+  }
+}
+
+/** Запрос к SW; в памяти вкладки кладём только успешные ответы (иначе залипаем на «нет иконки»). */
 function getFaviconCached(pageUrl) {
   const key = String(pageUrl || '');
   if (!key) return Promise.resolve({ ok: false });
   const hit = vbFaviconSessionCache.get(key);
   if (hit) return Promise.resolve(hit);
+  const failUntil = vbFaviconFailUntil.get(key);
+  if (failUntil && Date.now() < failUntil) return Promise.resolve({ ok: false });
   return getFaviconViaBackground(key).then((fr) => {
-    vbFaviconSessionCache.set(key, fr);
+    if (fr && fr.ok && fr.dataUrl) {
+      vbFaviconSessionCache.set(key, fr);
+      vbFaviconFailUntil.delete(key);
+    } else {
+      vbFaviconFailUntil.set(key, Date.now() + VB_FAVICON_FAIL_COOLDOWN_MS);
+    }
     return fr;
   });
 }
@@ -1373,6 +1428,7 @@ async function pullServerMerge(opts = {}) {
   }
   app.lastServerSyncAt = Date.now();
   await saveLocal();
+  await warmFaviconSessionCacheFromStorage();
   return didFullRender;
 }
 
@@ -3606,6 +3662,7 @@ async function init() {
       await syncI18n();
       $('authTitle').textContent = tr('auth.titleLogin');
       $('authSubmit').textContent = tr('auth.submitLogin');
+      await warmFaviconSessionCacheFromStorage();
       renderAll();
     }
   } catch (_) {}
@@ -3642,6 +3699,7 @@ async function init() {
   await syncI18n();
   $('authTitle').textContent = tr(authMode === 'login' ? 'auth.titleLogin' : 'auth.titleRegister');
   $('authSubmit').textContent = tr(authMode === 'login' ? 'auth.submitLogin' : 'auth.submitRegister');
+  await warmFaviconSessionCacheFromStorage();
   renderAll();
 
   document.addEventListener('click', onGlobalClick);
