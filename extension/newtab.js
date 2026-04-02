@@ -192,7 +192,8 @@ const DEFAULT_SETTINGS = {
   openLinksInNewTab: false,
   changeBgDaily: false,
   theme: 'auto',
-  language: 'ru',
+  /** auto | ru | uk | en | hy — при auto язык берётся из UI браузера */
+  uiLanguage: 'auto',
   _lastBgDay: null,
   /** Виджет Google Календаря на новой вкладке */
   showCalendar: true,
@@ -277,6 +278,18 @@ let app = {
   /** Успешный обмен с Crypt-Chain (pull/push); следующий фоновый pull не раньше чем через минуту отсюда */
   lastServerSyncAt: null,
 };
+
+function tr(key) {
+  return typeof VisualBookmarksI18n !== 'undefined' ? VisualBookmarksI18n.t(key) : key;
+}
+function trR(key, vars) {
+  return typeof VisualBookmarksI18n !== 'undefined' ? VisualBookmarksI18n.tReplace(key, vars) : key;
+}
+function syncI18n() {
+  if (typeof VisualBookmarksI18n === 'undefined') return;
+  VisualBookmarksI18n.syncFromSettings(app.settings);
+  VisualBookmarksI18n.applyDom(document);
+}
 
 let editingBookmarkId = null;
 let pendingDeleteBookmarkId = null;
@@ -495,6 +508,11 @@ function syncMaxBookmarksToStoredCount() {
 
 function mergeSettings(base, patch) {
   const out = { ...base, ...patch };
+  delete out.language;
+  const langAllowed = ['auto', 'ru', 'uk', 'en', 'hy'];
+  if (!out.uiLanguage || !langAllowed.includes(out.uiLanguage)) {
+    out.uiLanguage = DEFAULT_SETTINGS.uiLanguage;
+  }
   let n = out.maxBookmarks;
   if (typeof n !== 'number' || Number.isNaN(n)) {
     n =
@@ -960,11 +978,12 @@ function normalizeServerUpdatedAt(raw) {
 
 /**
  * Слияние с сервером Crypt-Chain.
- * @param {{ allowSeedPush?: boolean }} opts — allowSeedPush: при 204 один раз отправить локальное состояние (вход, ручная синхронизация); false для таймера, чтобы не дёргать PUT каждую минуту.
+ * @param {{ allowSeedPush?: boolean; applyRemoteSettings?: boolean }} opts — allowSeedPush: при 204 один раз отправить локальное состояние (вход, ручная синхронизация); false для таймера, чтобы не дёргать PUT каждую минуту. applyRemoteSettings: подставлять ли с сервера объект settings (false — только закладки; так фоновый pull при открытии вкладки не затирает тему/язык с другого ноутбута).
  * @returns {Promise<boolean>} true если был полный renderAll (данные с сервера изменились)
  */
 async function pullServerMerge(opts = {}) {
   const allowSeedPush = opts.allowSeedPush !== false;
+  const applyRemoteSettings = opts.applyRemoteSettings !== false;
   let didFullRender = false;
   if (typeof VisualBookmarksApi === 'undefined') return false;
   const remote = await VisualBookmarksApi.pullSyncState();
@@ -1470,7 +1489,7 @@ async function connectGoogleCalendar() {
   logCalendarConnect('connectGoogleCalendar() вызван');
   if (typeof VisualBookmarksCalendar === 'undefined') {
     console.warn('[VB Calendar] VisualBookmarksCalendar не определён (проверьте google-calendar.js в newtab.html)');
-    alert('Модуль календаря не загружен (файл google-calendar.js).');
+    alert(tr('alert.calModule'));
     return;
   }
   if (calendarConnectInFlight) {
@@ -1510,13 +1529,13 @@ async function connectGoogleCalendar() {
         return;
       }
       console.warn('[VB Calendar] worker вернул ошибку:', resp.error);
-      alert(resp.error || 'Не удалось подключить календарь');
+      alert(resp.error || tr('alert.calConnectFail'));
       return;
     }
 
     logCalendarConnect('fallback: подключение на странице (нет sendMessage)');
     const token = await VisualBookmarksCalendar.getAuthToken(true);
-    if (!token) throw new Error('Токен не получен');
+    if (!token) throw new Error(tr('alert.calToken'));
     const events = await VisualBookmarksCalendar.fetchTodayEvents(token);
     await finishOk(events);
   } catch (e) {
@@ -1545,7 +1564,9 @@ function renderCalendarWidget() {
     root.innerHTML =
       '<button type="button" class="calendar-connect-pill" id="calendarWidgetConnect">' +
       '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>' +
-      '<span>Подключить календарь</span></button>';
+      '<span>' +
+      escapeHtml(tr('cal.connect')) +
+      '</span></button>';
     const w = document.getElementById('calendarWidgetConnect');
     if (w) w.addEventListener('click', () => showModal('modalCalendarConnect'));
     return;
@@ -1553,7 +1574,9 @@ function renderCalendarWidget() {
 
   if (!extOk) {
     root.innerHTML =
-      '<div class="calendar-panel"><span class="calendar-panel__title">Календарь доступен только в расширении Chrome</span></div>';
+      '<div class="calendar-panel"><span class="calendar-panel__title">' +
+      escapeHtml(tr('cal.extensionOnly')) +
+      '</span></div>';
     return;
   }
 
@@ -1561,7 +1584,9 @@ function renderCalendarWidget() {
     root.innerHTML =
       '<div class="calendar-panel" style="gap:0.5rem">' +
       '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>' +
-      '<span class="calendar-panel__title" style="flex:1">Нет событий на сегодня</span></div>';
+      '<span class="calendar-panel__title" style="flex:1">' +
+      escapeHtml(tr('cal.noEvents')) +
+      '</span></div>';
     return;
   }
 
@@ -1583,7 +1608,11 @@ function renderCalendarWidget() {
       : '') +
     '</div></div>' +
     (many
-      ? '<button type="button" class="calendar-panel__next" id="calendarWidgetNext" title="Следующее событие" aria-label="Следующее"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></button>'
+      ? '<button type="button" class="calendar-panel__next" id="calendarWidgetNext" title="' +
+        escapeAttr(tr('cal.nextTitle')) +
+        '" aria-label="' +
+        escapeAttr(tr('cal.nextAria')) +
+        '"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></button>'
       : '') +
     '</div>';
 
@@ -1663,8 +1692,17 @@ function applyBackground() {
 }
 
 /* --- Stability UI --- */
+function formatLocaleTag() {
+  const map = { ru: 'ru-RU', uk: 'uk-UA', en: 'en-US', hy: 'hy-AM' };
+  const l =
+    typeof VisualBookmarksI18n !== 'undefined'
+      ? VisualBookmarksI18n.resolveEffectiveLocale(app.settings)
+      : 'ru';
+  return map[l] || 'ru-RU';
+}
+
 function formatNum(n, d = 2) {
-  return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: d, maximumFractionDigits: d });
+  return Number(n).toLocaleString(formatLocaleTag(), { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
 function renderStability() {
@@ -1697,16 +1735,24 @@ function renderStability() {
 
   const exp = $('stabilityExpanded');
   exp.innerHTML =
-    '<div><span class="text-muted">Пакет: </span><span style="color:#fbbf24">' +
-    MOCK_STABILITY.packageType +
+    '<div><span class="text-muted">' +
+    escapeHtml(tr('stab.exp.package')) +
+    '</span><span style="color:#fbbf24">' +
+    escapeHtml(MOCK_STABILITY.packageType) +
     '</span></div>' +
-    '<div><span class="text-muted">Ранг: </span><span style="color:#c084fc">' +
-    MOCK_STABILITY.rank +
+    '<div><span class="text-muted">' +
+    escapeHtml(tr('stab.exp.rank')) +
+    '</span><span style="color:#c084fc">' +
+    escapeHtml(MOCK_STABILITY.rank) +
     '</span></div>' +
-    '<div><span class="text-muted">STAB: </span>' +
+    '<div><span class="text-muted">' +
+    escapeHtml(tr('stab.exp.stab')) +
+    '</span>' +
     formatNum(MOCK_STABILITY.stab) +
     '</div>' +
-    '<div><span class="text-muted">Total: </span><span style="color:#4ade80">$' +
+    '<div><span class="text-muted">' +
+    escapeHtml(tr('stab.exp.total')) +
+    '</span><span style="color:#4ade80">$' +
     formatNum(MOCK_STABILITY.totalBalance) +
     '</span></div>';
 
@@ -1726,10 +1772,21 @@ function renderStabilityDropdown() {
   }
   dd.classList.remove('is-hidden');
   let html =
-    '<div class="stability-dropdown__head"><span>Уведомления</span>' +
-    (notifications.some((n) => !n.read) ? '<button type="button" id="stabReadAll" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:0.75rem">Прочитать все</button>' : '') +
+    '<div class="stability-dropdown__head"><span>' +
+    escapeHtml(tr('stab.notifTitle')) +
+    '</span>' +
+    (notifications.some((n) => !n.read)
+      ? '<button type="button" id="stabReadAll" style="background:none;border:none;color:#60a5fa;cursor:pointer;font-size:0.75rem">' +
+        escapeHtml(tr('stab.markAllRead')) +
+        '</button>'
+      : '') +
     '</div>';
-  if (!notifications.length) html += '<div style="padding:1rem;text-align:center;color:rgba(255,255,255,0.5);font-size:0.875rem">Нет уведомлений</div>';
+  if (!notifications.length) {
+    html +=
+      '<div style="padding:1rem;text-align:center;color:rgba(255,255,255,0.5);font-size:0.875rem">' +
+      escapeHtml(tr('stab.noNotifications')) +
+      '</div>';
+  }
   else {
     notifications.forEach((n) => {
       html +=
@@ -1802,7 +1859,7 @@ function renderSearch() {
   const icon = $('engineIcon');
   icon.src = eng.icon;
   icon.alt = eng.name;
-  $('searchInput').placeholder = eng.placeholder;
+  $('searchInput').placeholder = tr('search.ph.' + eng.id);
   const menu = $('engineMenu');
   if (!engineMenuOpen) menu.classList.add('is-hidden');
   else {
@@ -1873,7 +1930,7 @@ function renderInfoPanel() {
     return;
   }
   el.classList.remove('is-hidden');
-  el.textContent = 'Информационная панель. Данные можно подключить к API позже.';
+  el.textContent = tr('info.panelText');
 }
 
 const DELETE_RING_R = 28;
@@ -1989,7 +2046,9 @@ function renderGrid() {
         '" data-grid-index="' +
         index +
         '" draggable="false">' +
-        '<div class="bm-card bm-card--delete-pending" tabindex="0" data-cancel-delete="1" role="button" aria-label="Отменить удаление">' +
+        '<div class="bm-card bm-card--delete-pending" tabindex="0" data-cancel-delete="1" role="button" aria-label="' +
+        escapeAttr(tr('aria.cancelDelete')) +
+        '">' +
         '<div class="bm-card-delete-overlay">' +
         '<div class="bm-card-delete-overlay__ring">' +
         '<svg class="bm-card-delete-overlay__svg" viewBox="0 0 64 64" aria-hidden="true">' +
@@ -2003,7 +2062,9 @@ function renderGrid() {
         '<span class="bm-card-delete-overlay__undo" aria-hidden="true">' +
         '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13"/></svg>' +
         '</span></div>' +
-        '<span class="bm-card-delete-overlay__hint">Нажмите для отмены</span>' +
+        '<span class="bm-card-delete-overlay__hint">' +
+        escapeHtml(tr('del.cardHint')) +
+        '</span>' +
         '</div></div></div>';
       return;
     }
@@ -2032,11 +2093,15 @@ function renderGrid() {
       '<div class="bm-card__actions">' +
       '<button type="button" class="bm-card__action-btn bm-card__action-btn--edit" data-action="edit" data-id="' +
       escapeAttr(b.id) +
-      '" aria-label="Редактировать">' +
+      '" aria-label="' +
+      escapeAttr(tr('aria.editBm')) +
+      '">' +
       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></button>' +
       '<button type="button" class="bm-card__action-btn bm-card__action-btn--del" data-action="del" data-id="' +
       escapeAttr(b.id) +
-      '" aria-label="Удалить">' +
+      '" aria-label="' +
+      escapeAttr(tr('aria.delBm')) +
+      '">' +
       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14zM10 11v6M14 11v6"/></svg></button>' +
       '</div>';
     if ((b.clickCount || 0) > 0) html += '<div class="bm-card__clicks" style="color:' + tc + '">' + b.clickCount + '</div>';
@@ -2062,7 +2127,9 @@ function renderGrid() {
   html +=
     '<button type="button" class="bm-add" id="gridAddBm"' +
     (atMax ? ' disabled' : '') +
-    '><span class="bm-add__circle"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></span><span class="bm-add__text">Добавить закладку</span></button>';
+    '><span class="bm-add__circle"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></span><span class="bm-add__text">' +
+    escapeHtml(tr('grid.addBookmark')) +
+    '</span></button>';
 
   grid.innerHTML = html;
 
@@ -2170,8 +2237,8 @@ function openBookmarkModal(bm) {
   editingBookmarkId = bm ? bm.id : null;
   bmAutoColor = false;
   bmColorUserTouched = false;
-  $('bookmarkModalTitle').textContent = bm ? 'Редактировать закладку' : 'Добавить закладку';
-  $('bmSubmit').textContent = bm ? 'Сохранить' : 'Добавить';
+  $('bookmarkModalTitle').textContent = bm ? tr('bm.titleEdit') : tr('bm.titleAdd');
+  $('bmSubmit').textContent = bm ? tr('bm.save') : tr('bm.add');
   $('bmTitle').value = bm?.title || '';
   $('bmUrl').value = bm?.url || '';
   $('bmDesc').value = bm?.description || '';
@@ -2245,21 +2312,21 @@ function applyRecentTabToBookmarkForm(title, url) {
 
 function loadRecentTabsForBookmarkModal() {
   const listEl = $('bmRecentTabsList');
-  listEl.innerHTML = '<span class="bm-recent-tabs__loading">Загрузка…</span>';
+  listEl.innerHTML = '<span class="bm-recent-tabs__loading">' + escapeHtml(tr('bm.recent.loading')) + '</span>';
   if (!isExtensionContext() || typeof chrome === 'undefined' || !chrome.tabs?.query) {
-    listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+    listEl.innerHTML = '<span class="bm-recent-tabs__empty">' + escapeHtml(tr('bm.recent.unavailable')) + '</span>';
     return;
   }
   try {
     chrome.tabs.getCurrent((selfTab) => {
       if (chrome.runtime.lastError) {
-        listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+        listEl.innerHTML = '<span class="bm-recent-tabs__empty">' + escapeHtml(tr('bm.recent.unavailable')) + '</span>';
         return;
       }
       const selfId = selfTab?.id;
       chrome.tabs.query({ currentWindow: true }, (tabs) => {
         if (chrome.runtime.lastError) {
-          listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+          listEl.innerHTML = '<span class="bm-recent-tabs__empty">' + escapeHtml(tr('bm.recent.unavailable')) + '</span>';
           return;
         }
         const sorted = (tabs || [])
@@ -2275,7 +2342,7 @@ function loadRecentTabsForBookmarkModal() {
           .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
           .slice(0, 6);
         if (!sorted.length) {
-          listEl.innerHTML = '<span class="bm-recent-tabs__empty">Нет других вкладок в окне</span>';
+          listEl.innerHTML = '<span class="bm-recent-tabs__empty">' + escapeHtml(tr('bm.recent.emptyTabs')) + '</span>';
           return;
         }
         listEl.innerHTML = sorted
@@ -2311,7 +2378,7 @@ function loadRecentTabsForBookmarkModal() {
       });
     });
   } catch (_) {
-    listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+    listEl.innerHTML = '<span class="bm-recent-tabs__empty">' + escapeHtml(tr('bm.recent.unavailable')) + '</span>';
   }
 }
 
@@ -2342,7 +2409,7 @@ function renderColorPresets(selected) {
 
 function updateBmPreview() {
   const bg = $('bmColorPicker').value;
-  const title = $('bmTitle').value || 'Название';
+  const title = $('bmTitle').value || tr('bm.previewDefault');
   const url = $('bmUrl').value;
   const tc = contrastColor(bg);
   let pageBase = '';
@@ -2534,7 +2601,38 @@ function renderSettingsPanels() {
 
   $('settingsPanelAppearance').innerHTML =
     '<section class="mb-6">' +
-    '<h2 class="settings-section-title">Тема оформления</h2>' +
+    '<h2 class="settings-section-title">' +
+    escapeHtml(tr('set.langTitle')) +
+    '</h2>' +
+    '<select class="settings-select" id="selUiLanguage">' +
+    ['auto', 'ru', 'uk', 'en', 'hy']
+      .map((code) => {
+        const label =
+          code === 'auto'
+            ? tr('set.langAuto')
+            : code === 'ru'
+              ? tr('set.langRu')
+              : code === 'uk'
+                ? tr('set.langUk')
+                : code === 'en'
+                  ? tr('set.langEn')
+                  : tr('set.langHy');
+        return (
+          '<option value="' +
+          code +
+          '"' +
+          ((s.uiLanguage || 'auto') === code ? ' selected' : '') +
+          '>' +
+          escapeHtml(label) +
+          '</option>'
+        );
+      })
+      .join('') +
+    '</select></section>' +
+    '<section class="mb-6">' +
+    '<h2 class="settings-section-title">' +
+    escapeHtml(tr('set.themeTitle')) +
+    '</h2>' +
     '<div class="theme-btns">' +
     ['auto', 'light', 'dark']
       .map(
@@ -2546,15 +2644,19 @@ function renderSettingsPanels() {
           '">' +
           (t === 'auto' ? '🖥' : t === 'light' ? '☀' : '🌙') +
           '<span>' +
-          (t === 'auto' ? 'Авто' : t === 'light' ? 'Светлая' : 'Тёмная') +
+          escapeHtml(t === 'auto' ? tr('set.themeAuto') : t === 'light' ? tr('set.themeLight') : tr('set.themeDark')) +
           '</span></button>'
       )
       .join('') +
     '</div></section>' +
     '<section class="mb-6">' +
-    '<h2 class="settings-section-title">Фон</h2>' +
+    '<h2 class="settings-section-title">' +
+    escapeHtml(tr('set.bgTitle')) +
+    '</h2>' +
     '<div style="display:flex;justify-content:flex-end;margin-bottom:0.5rem">' +
-    '<button type="button" class="backup-btn" id="btnUploadBg">Загрузить свой фон</button></div>' +
+    '<button type="button" class="backup-btn" id="btnUploadBg">' +
+    escapeHtml(tr('set.uploadBg')) +
+    '</button></div>' +
     '<div class="bg-gallery-wrap">' +
     '<button type="button" class="bg-gallery-nav bg-gallery-nav--prev" id="bgPrev"' +
     (bgPage === 0 ? ' disabled' : '') +
@@ -2580,43 +2682,73 @@ function renderSettingsPanels() {
     '</div></div>' +
     '<label class="settings-check" style="margin-top:0.75rem"><input type="checkbox" id="chkDailyBg"' +
     (s.changeBgDaily ? ' checked' : '') +
-    '/><span>Менять фон каждый день</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.dailyBg')) +
+    '</span></label>' +
     '</section>' +
     '<section class="mb-6">' +
-    '<h2 class="settings-section-title">Дополнительные параметры</h2>' +
+    '<h2 class="settings-section-title">' +
+    escapeHtml(tr('set.extraTitle')) +
+    '</h2>' +
     '<label class="settings-check"><input type="checkbox" id="chkBar"' +
     (s.showBookmarksBar ? ' checked' : '') +
-    '/><span>Панель закладок</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.bookmarksBar')) +
+    '</span></label>' +
     '<label class="settings-check"><input type="checkbox" id="chkSearch"' +
     (s.showSearch !== false ? ' checked' : '') +
-    '/><span>Поисковая строка</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.searchBar')) +
+    '</span></label>' +
     '<label class="settings-check"><input type="checkbox" id="chkInfo"' +
     (s.showInfoPanel ? ' checked' : '') +
-    '/><span>Показывать информационную панель</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.infoPanel')) +
+    '</span></label>' +
     '<label class="settings-check"><input type="checkbox" id="chkStab"' +
     (s.showStabilityInfo ? ' checked' : '') +
-    '/><span>Отображать настройки Stability</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.stability')) +
+    '</span></label>' +
     '<label class="settings-check"><input type="checkbox" id="chkNewTab"' +
     (s.openLinksInNewTab ? ' checked' : '') +
-    '/><span>Открывать ссылки в новой вкладке</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.openNewTab')) +
+    '</span></label>' +
     '<label class="settings-check"><input type="checkbox" id="chkCalendar"' +
     (s.showCalendar !== false ? ' checked' : '') +
-    '/><span>Показывать виджет Google Календаря</span></label>' +
+    '/><span>' +
+    escapeHtml(tr('set.showCalendar')) +
+    '</span></label>' +
     '</section>' +
     (s.showCalendar !== false
       ? '<section class="mb-6">' +
-        '<h2 class="settings-section-title">Google Календарь</h2>' +
-        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">События на сегодня из основного календаря (primary). Включение/выключение сохраняется в аккаунте Crypt-Chain вместе с настройками — на другом компьютере после входа состояние подтянется; токен Google остаётся в Chrome на каждом устройстве, при необходимости один раз подтвердите доступ. OAuth: <code style="font-size:0.75rem">chrome.identity</code>, scope <code style="font-size:0.75rem">calendar.readonly</code>. В Google Cloud включите <strong>Google Calendar API</strong>.</p>' +
+        '<h2 class="settings-section-title">' +
+        escapeHtml(tr('set.calendarTitle')) +
+        '</h2>' +
+        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">' +
+        escapeHtml(tr('set.calendarHelp')) +
+        '</p>' +
         '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem">' +
         (s.googleCalendarEnabled
-          ? '<span class="settings-calendar-status settings-calendar-status--ok">Календарь подключен</span>' +
-            '<button type="button" class="backup-btn" id="btnCalendarSettingsDisconnect">Отключить</button>'
-          : '<span class="settings-calendar-status">Не подключен</span>' +
-            '<button type="button" class="backup-btn" id="btnCalendarSettingsConnect">Подключить</button>') +
+          ? '<span class="settings-calendar-status settings-calendar-status--ok">' +
+            escapeHtml(tr('set.calendarConnected')) +
+            '</span>' +
+            '<button type="button" class="backup-btn" id="btnCalendarSettingsDisconnect">' +
+            escapeHtml(tr('set.disconnect')) +
+            '</button>'
+          : '<span class="settings-calendar-status">' +
+            escapeHtml(tr('set.calendarDisconnected')) +
+            '</span>' +
+            '<button type="button" class="backup-btn" id="btnCalendarSettingsConnect">' +
+            escapeHtml(tr('set.connect')) +
+            '</button>') +
         '</div></section>'
       : '') +
     (s.showSearch !== false
-      ? '<section class="mb-6"><h2 class="settings-section-title">Поисковая система</h2><div class="engine-grid">' +
+      ? '<section class="mb-6"><h2 class="settings-section-title">' +
+        escapeHtml(tr('set.searchEngineTitle')) +
+        '</h2><div class="engine-grid">' +
         SEARCH_ENGINES.map(
           (e) =>
             '<button type="button" class="engine-btn' +
@@ -2631,7 +2763,9 @@ function renderSettingsPanels() {
         ).join('') +
         '</div></section>'
       : '') +
-    '<section class="mb-6"><h2 class="settings-section-title">Колонки сетки</h2>' +
+    '<section class="mb-6"><h2 class="settings-section-title">' +
+    escapeHtml(tr('set.gridCols')) +
+    '</h2>' +
     '<div class="settings-row"><input type="range" class="settings-range" min="2" max="6" id="rangeCols" value="' +
     (s.gridColumns || 5) +
     '"/><span style="width:2rem;text-align:center;font-size:0.875rem">' +
@@ -2640,8 +2774,12 @@ function renderSettingsPanels() {
 
   $('settingsPanelBookmarks').innerHTML =
     '<section class="mb-6">' +
-    '<h2 class="settings-section-title">Закладки</h2>' +
-    '<div class="settings-row"><label class="settings-label-inline">Количество</label>' +
+    '<h2 class="settings-section-title">' +
+    escapeHtml(tr('set.bookmarksTitle')) +
+    '</h2>' +
+    '<div class="settings-row"><label class="settings-label-inline">' +
+    escapeHtml(tr('set.count')) +
+    '</label>' +
     '<input type="range" class="settings-range" min="' +
     MIN_BOOKMARKS_LIMIT +
     '" max="' +
@@ -2651,16 +2789,24 @@ function renderSettingsPanels() {
     '"/><span style="width:2rem;text-align:center;font-size:0.875rem" id="maxBmLabel">' +
     (s.maxBookmarks ?? DEFAULT_SETTINGS.maxBookmarks) +
     '</span></div>' +
-    '<div class="settings-row" style="margin-top:0.75rem"><label class="settings-label-inline">Вид</label>' +
+    '<div class="settings-row" style="margin-top:0.75rem"><label class="settings-label-inline">' +
+    escapeHtml(tr('set.view')) +
+    '</label>' +
     '<select class="settings-select" id="selView">' +
     '<option value="icons"' +
     (s.bookmarkView === 'icons' ? ' selected' : '') +
-    '>Иконки сайтов</option>' +
+    '>' +
+    escapeHtml(tr('set.viewIcons')) +
+    '</option>' +
     '<option value="screenshots"' +
     (s.bookmarkView === 'screenshots' ? ' selected' : '') +
-    '>Скриншоты сайтов</option></select></div>' +
+    '>' +
+    escapeHtml(tr('set.viewScreenshots')) +
+    '</option></select></div>' +
     '<div style="margin-top:1rem;display:flex;gap:0.5rem">' +
-    '<button type="button" class="backup-btn" id="setAddBm">Добавить закладку</button></div>' +
+    '<button type="button" class="backup-btn" id="setAddBm">' +
+    escapeHtml(tr('set.addBm')) +
+    '</button></div>' +
     '<div class="bm-settings-list" style="margin-top:0.75rem">' +
     sortedBookmarks()
       .map(
@@ -2672,29 +2818,53 @@ function renderSettingsPanels() {
           '</div></div><div class="bm-settings-row__actions">' +
           '<button type="button" class="icon-btn" data-set-edit="' +
           escapeAttr(b.id) +
-          '">Изм.</button>' +
+          '">' +
+          escapeHtml(tr('set.editBm')) +
+          '</button>' +
           '<button type="button" class="icon-btn icon-btn--danger" data-set-del="' +
           escapeAttr(b.id) +
-          '">Удал.</button></div></div>'
+          '">' +
+          escapeHtml(tr('set.delBm')) +
+          '</button></div></div>'
       )
       .join('') +
     '</div></section>';
 
   $('settingsPanelSystem').innerHTML =
-    '<section class="mb-6"><h2 class="settings-section-title">Аккаунт</h2>' +
-    '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">Вход на Crypt-Chain. <strong>Вход:</strong> данные с сервера сливаются с локальными по времени последнего изменения (что новее — то главное; при пустом облаке уходит локальная копия). <strong>Регистрация:</strong> ваши текущие закладки и настройки отправляются в облако. Синхронизация в фоне; следующая проверка сервера — не раньше минуты после последней успешной синхронизации. Кнопка «Синхронизировать» — сразу.</p>' +
+    '<section class="mb-6"><h2 class="settings-section-title">' +
+    escapeHtml(tr('set.accountTitle')) +
+    '</h2>' +
+    '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">' +
+    escapeHtml(tr('set.accountHelp')) +
+    '</p>' +
     '<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:0.5rem">' +
-    '<p style="font-size:0.8rem;margin:0"><a href="#" id="linkCryptChainLogin" style="color:#2563eb;text-decoration:underline">Открыть страницу входа crypt-chain.com</a></p>' +
+    '<p style="font-size:0.8rem;margin:0"><a href="#" id="linkCryptChainLogin" style="color:#2563eb;text-decoration:underline">' +
+    escapeHtml(tr('set.openLoginPage')) +
+    '</a></p>' +
     '<div style="display:flex;flex-wrap:wrap;gap:0.5rem">' +
-    '<button type="button" class="backup-btn" id="btnServerSync">Синхронизировать</button>' +
-    '<button type="button" class="backup-btn" id="btnServerLogout">Выйти из аккаунта</button></div>' +
+    '<button type="button" class="backup-btn" id="btnServerSync">' +
+    escapeHtml(tr('set.sync')) +
+    '</button>' +
+    '<button type="button" class="backup-btn" id="btnServerLogout">' +
+    escapeHtml(tr('set.logoutAccount')) +
+    '</button></div>' +
     '<p id="serverApiStatus" style="font-size:0.75rem;color:#6b7280;margin:0"></p></div></section>' +
-    '<section class="mb-6"><h2 class="settings-section-title">Резервное копирование</h2>' +
+    '<section class="mb-6"><h2 class="settings-section-title">' +
+    escapeHtml(tr('set.backupTitle')) +
+    '</h2>' +
     '<div class="backup-btns">' +
-    '<button type="button" class="backup-btn" id="backupSave">Сохранить в файл</button>' +
-    '<button type="button" class="backup-btn" id="backupLoad">Загрузить из файла</button>' +
-    '<button type="button" class="backup-btn" id="backupReset" style="border-color:#fecaca;color:#b91c1c">Сбросить</button></div></section>' +
-    '<footer class="settings-footer"><p>Visual Bookmarks StabilityInternational 2.2.0</p></footer>';
+    '<button type="button" class="backup-btn" id="backupSave">' +
+    escapeHtml(tr('set.saveFile')) +
+    '</button>' +
+    '<button type="button" class="backup-btn" id="backupLoad">' +
+    escapeHtml(tr('set.loadFile')) +
+    '</button>' +
+    '<button type="button" class="backup-btn" id="backupReset" style="border-color:#fecaca;color:#b91c1c">' +
+    escapeHtml(tr('set.reset')) +
+    '</button></div></section>' +
+    '<footer class="settings-footer"><p>' +
+    escapeHtml(tr('set.footerVersion')) +
+    '</p></footer>';
 
   wireSettingsAppearance(totalPages);
   wireSettingsBookmarks();
@@ -2793,6 +2963,16 @@ function wireSettingsAppearance(totalPages) {
     if (sp) sp.textContent = String(app.settings.gridColumns);
     persist();
   });
+  const selLang = $('selUiLanguage');
+  if (selLang) {
+    selLang.addEventListener('change', () => {
+      app.settings.uiLanguage = selLang.value;
+      persist();
+      syncI18n();
+      renderAll();
+      renderSettingsIfOpen();
+    });
+  }
 }
 
 function wireSettingsBookmarks() {
@@ -2838,18 +3018,18 @@ function wireSettingsSystem() {
 
   $('btnServerSync').addEventListener('click', async () => {
     if (typeof VisualBookmarksApi === 'undefined') {
-      st.textContent = 'Клиент API не загружен';
+      st.textContent = tr('set.syncApiMissing');
       return;
     }
     if (!(await VisualBookmarksApi.hasToken())) {
-      st.textContent = 'Сначала войдите в аккаунт.';
+      st.textContent = tr('set.syncNeedLogin');
       return;
     }
-    st.textContent = 'Синхронизация…';
+    st.textContent = tr('set.syncing');
     try {
       await pullServerMerge({ allowSeedPush: true });
       scheduleCalendarRefreshAfterServerPull();
-      st.textContent = 'Синхронизация выполнена, ' + new Date().toLocaleTimeString();
+      st.textContent = tr('set.syncDonePrefix') + new Date().toLocaleTimeString();
     } catch (e) {
       st.textContent = e.message || String(e);
     }
@@ -2862,10 +3042,10 @@ function wireSettingsSystem() {
     e.preventDefault();
     e.stopPropagation();
     const stEl = $('serverApiStatus');
-    stEl.textContent = 'Выход…';
+    stEl.textContent = tr('set.logoutWorking');
     try {
       await performCryptChainLogout();
-      stEl.textContent = 'Вы вышли из аккаунта. Закладки и настройки сохранены, календарь отключён.';
+      stEl.textContent = tr('set.logoutDone');
     } catch (err) {
       console.warn('Выход из аккаунта:', err);
       stEl.textContent = err.message || String(err);
@@ -2886,7 +3066,7 @@ function wireSettingsSystem() {
   });
   $('backupLoad').addEventListener('click', () => $('hiddenImportFile').click());
   $('backupReset').addEventListener('click', async () => {
-    if (!confirm('Сбросить все закладки и настройки?')) return;
+    if (!confirm(tr('confirm.reset'))) return;
     resetDefaults();
     await persist();
     hideModal('modalSettings');
@@ -2977,7 +3157,7 @@ function openBrowserToolkitPage(kind) {
   const url = browserToolkitUrl(kind);
   if (!url) return;
   if (!isExtensionContext() || typeof chrome.tabs?.create !== 'function') {
-    alert('Доступно только в расширении Chrome (chrome://extensions → загрузить распакованное).');
+    alert(tr('alert.extensionOnly'));
     return;
   }
   chrome.tabs.create({ url }, () => {
@@ -3067,6 +3247,9 @@ async function init() {
       shownFromBoot = true;
       $('loader').classList.add('is-hidden');
       await hydrateCalendarEventsFromCacheIfPossible();
+      syncI18n();
+      $('authTitle').textContent = tr('auth.titleLogin');
+      $('authSubmit').textContent = tr('auth.submitLogin');
       renderAll();
     }
   } catch (_) {}
@@ -3091,6 +3274,9 @@ async function init() {
   if (!shownFromBoot) {
     $('loader').classList.add('is-hidden');
   }
+  syncI18n();
+  $('authTitle').textContent = tr(authMode === 'login' ? 'auth.titleLogin' : 'auth.titleRegister');
+  $('authSubmit').textContent = tr(authMode === 'login' ? 'auth.submitLogin' : 'auth.submitRegister');
   renderAll();
 
   document.addEventListener('click', onGlobalClick);
@@ -3098,8 +3284,8 @@ async function init() {
   $('btnLogin').addEventListener('click', () => {
     authMode = 'login';
     document.querySelectorAll('.auth-tab').forEach((x) => x.classList.toggle('is-active', x.getAttribute('data-auth-mode') === 'login'));
-    $('authTitle').textContent = 'Вход';
-    $('authSubmit').textContent = 'Войти';
+    $('authTitle').textContent = tr('auth.titleLogin');
+    $('authSubmit').textContent = tr('auth.submitLogin');
     $('authNameRow').classList.add('is-hidden');
     showModal('modalAuth');
   });
@@ -3173,8 +3359,8 @@ async function init() {
     b.addEventListener('click', () => {
       authMode = b.getAttribute('data-auth-mode');
       document.querySelectorAll('.auth-tab').forEach((x) => x.classList.toggle('is-active', x === b));
-      $('authTitle').textContent = authMode === 'login' ? 'Вход' : 'Регистрация';
-      $('authSubmit').textContent = authMode === 'login' ? 'Войти' : 'Зарегистрироваться';
+      $('authTitle').textContent = authMode === 'login' ? tr('auth.titleLogin') : tr('auth.titleRegister');
+      $('authSubmit').textContent = authMode === 'login' ? tr('auth.submitLogin') : tr('auth.submitRegister');
       $('authNameRow').classList.toggle('is-hidden', authMode === 'login');
     });
   });
@@ -3220,12 +3406,12 @@ async function init() {
     const url = normalizeUrl($('bmUrl').value.trim());
     const desc = $('bmDesc').value.trim();
     if (!title) {
-      alert('Введите название закладки.');
+      alert(tr('alert.bmTitle'));
       $('bmTitle').focus();
       return;
     }
     if (!url) {
-      alert('Введите адрес ссылки (URL).');
+      alert(tr('alert.bmUrl'));
       $('bmUrl').focus();
       return;
     }
@@ -3251,11 +3437,7 @@ async function init() {
     } else {
       const cap = effectiveMaxBookmarks();
       if (app.bookmarks.length >= cap) {
-        alert(
-          'Достигнут лимит закладок (' +
-            cap +
-            '). Увеличьте лимит во вкладке «Закладки» в настройках.'
-        );
+        alert(trR('alert.bmLimit', { n: cap }));
         return;
       }
       newId = generateId();
@@ -3278,7 +3460,7 @@ async function init() {
       if (fromFavicon && targetId) void refineBookmarkTileColor(targetId, url);
     } catch (err) {
       console.error(err);
-      alert('Не удалось сохранить закладку: ' + (err.message || String(err)));
+      alert(tr('alert.bmSaveFail') + (err.message || String(err)));
     }
   });
 
@@ -3334,7 +3516,7 @@ async function init() {
     $('hiddenBgFile').value = '';
     if (!f) return;
     if (typeof VisualBookmarksCustomBg === 'undefined') {
-      alert('Не загружен custom-background-idb.js');
+      alert(tr('alert.bgIdb'));
       return;
     }
     try {
@@ -3384,7 +3566,7 @@ async function init() {
           } catch (_) {}
         })();
       } catch (err) {
-        alert('Ошибка импорта: ' + err.message);
+        alert(tr('alert.importErr') + err.message);
       }
     });
   });
