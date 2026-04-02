@@ -29,8 +29,8 @@
 Без OAuth синхронизация Drive недоступна; **расширение полностью работает локально**. Вход в Google настраивается в **Настройки → вкладка «Система»**.
 
 1. Откройте [Google Cloud Console](https://console.cloud.google.com/) и создайте проект (или выберите существующий).
-2. Включите API: **Google Drive API** (APIs & Services → Library → Google Drive API → Enable).
-3. **APIs & Services → OAuth consent screen**: тип *External*, заполните название приложения, свой email, сохраните.
+2. Включите API: **Google Drive API** и **Google Calendar API** (Library → Enable для каждого).
+3. **APIs & Services → OAuth consent screen**: тип *External*, заполните название приложения, свой email, сохраните. В разделе scopes для проверки укажите чтение календаря, если требуется: `.../auth/calendar.readonly` (он уже прописан в `manifest.json` вместе с Drive).
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
 5. Тип приложения: **Chrome extension**.
 6. Поле **Item ID**: скопируйте **ID расширения** со страницы `chrome://extensions` (у пункта «Visual Bookmarks StabilityInternational»). Это строка из 32 символов.
@@ -39,6 +39,8 @@
 9. Перезагрузите расширение на `chrome://extensions`.
 
 Данные на Drive пишутся в файл `visual-bookmarks-sync.json` в [папке данных приложения](https://developers.google.com/drive/api/guides/appdata) — в обычном интерфейсе Drive он не отображается.
+
+**Виджет Google Календаря** на новой вкладке использует тот же OAuth Client ID и общий токен `chrome.identity`: после добавления scope `calendar.readonly` пользователям может понадобиться **повторно выдать доступ** (войти в Google в настройках или подключить календарь). События на **текущие сутки** читаются **только из основного календаря аккаунта** (в API `calendarList` у него `primary: true`, обычно это адрес `@gmail.com`); семейные календари, праздники и другие подписки **не** запрашиваются. Если список календарей недоступен, используется псевдоним **`primary`**. Запись в календарь не выполняется. Отключение календаря в настройках не отзывает токен (чтобы не ломать синхронизацию Drive).
 
 ## Разрешения
 
@@ -64,6 +66,7 @@ extension/
   newtab.css
   newtab.js
   api-client.js
+  google-calendar.js
   background.js
   SERVER_API.md
   icons/

@@ -96,6 +96,10 @@ const DEFAULT_SETTINGS = {
   theme: 'auto',
   language: 'ru',
   _lastBgDay: null,
+  /** Виджет Google Календаря на новой вкладке */
+  showCalendar: true,
+  /** Пользователь прошёл OAuth и хочет показывать события (токен общий с Drive) */
+  googleCalendarEnabled: false,
 };
 
 /** Стартовые закладки: цвет фона подбирается из логотипа (favicon) после первого запуска */
@@ -193,6 +197,11 @@ let notifications = MOCK_NOTIFICATIONS.map((n) => ({ ...n }));
 let bmAutoColor = false;
 /** Пользователь вручную менял цвет в модалке (иначе при «Добавить» цвет берётся с favicon) */
 let bmColorUserTouched = false;
+
+/** События primary-календаря на сегодня (Google Calendar API) */
+let calendarEvents = [];
+let calendarEventIndex = 0;
+let calendarRotateTimer = null;
 
 const $ = (id) => {
   const el = document.getElementById(id);
@@ -951,6 +960,160 @@ function pickDailyPreset() {
   app.settings._lastBgDay = day;
 }
 
+function stopCalendarRotation() {
+  if (calendarRotateTimer != null) {
+    clearInterval(calendarRotateTimer);
+    calendarRotateTimer = null;
+  }
+}
+
+function startCalendarRotation() {
+  stopCalendarRotation();
+  if (!app.settings.googleCalendarEnabled || calendarEvents.length <= 1) return;
+  calendarRotateTimer = setInterval(() => {
+    calendarEventIndex = (calendarEventIndex + 1) % calendarEvents.length;
+    renderCalendarWidget();
+  }, 5000);
+}
+
+async function refreshCalendarEvents() {
+  stopCalendarRotation();
+  if (!app.settings.googleCalendarEnabled || typeof VisualBookmarksCalendar === 'undefined') {
+    calendarEvents = [];
+    calendarEventIndex = 0;
+    renderCalendarWidget();
+    return;
+  }
+  const VBC = VisualBookmarksCalendar;
+  const shouldRetryAuth = (err) => {
+    const st = err && err.status;
+    if (st === 401 || st === 403) return true;
+    const m = String((err && err.message) || err || '');
+    return (
+      m.includes('401') ||
+      m.includes('UNAUTHORIZED') ||
+      m.includes('Invalid Credentials') ||
+      (m.includes('403') && (m.includes('insufficient') || m.includes('Insufficient')))
+    );
+  };
+
+  try {
+    let token = await VBC.getAuthToken(false);
+    if (!token) {
+      calendarEvents = [];
+      renderCalendarWidget();
+      return;
+    }
+    const load = async (t) => {
+      calendarEvents = await VBC.fetchTodayEvents(t);
+      calendarEventIndex = 0;
+      renderCalendarWidget();
+      startCalendarRotation();
+    };
+    try {
+      await load(token);
+    } catch (apiErr) {
+      if (shouldRetryAuth(apiErr) && typeof VBC.removeCachedAuthToken === 'function') {
+        await VBC.removeCachedAuthToken(token);
+        token = await VBC.getAuthToken(true);
+        if (token) await load(token);
+        else throw apiErr;
+      } else {
+        throw apiErr;
+      }
+    }
+  } catch (e) {
+    console.warn('Google Calendar:', e);
+    calendarEvents = [];
+    renderCalendarWidget();
+  }
+}
+
+async function connectGoogleCalendar() {
+  if (typeof VisualBookmarksCalendar === 'undefined') {
+    alert('Модуль календаря не загружен (файл google-calendar.js).');
+    return;
+  }
+  try {
+    const token = await VisualBookmarksCalendar.getAuthToken(true);
+    if (!token) throw new Error('Токен не получен');
+    await VisualBookmarksCalendar.fetchTodayEvents(token);
+    app.settings.googleCalendarEnabled = true;
+    hideModal('modalCalendarConnect');
+    await persist();
+    await refreshCalendarEvents();
+  } catch (e) {
+    alert((e && e.message) || String(e));
+  }
+}
+
+function renderCalendarWidget() {
+  const root = $('calendarWidgetRoot');
+  if (!root) return;
+  if (app.settings.showCalendar === false) {
+    root.classList.add('is-hidden');
+    stopCalendarRotation();
+    return;
+  }
+  root.classList.remove('is-hidden');
+
+  const extOk = typeof chrome !== 'undefined' && chrome.identity;
+
+  if (!app.settings.googleCalendarEnabled) {
+    root.innerHTML =
+      '<button type="button" class="calendar-connect-pill" id="calendarWidgetConnect">' +
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>' +
+      '<span>Подключить календарь</span></button>';
+    const w = document.getElementById('calendarWidgetConnect');
+    if (w) w.addEventListener('click', () => showModal('modalCalendarConnect'));
+    return;
+  }
+
+  if (!extOk) {
+    root.innerHTML =
+      '<div class="calendar-panel"><span class="calendar-panel__title">Календарь доступен только в расширении Chrome</span></div>';
+    return;
+  }
+
+  if (!calendarEvents.length) {
+    root.innerHTML =
+      '<div class="calendar-panel" style="gap:0.5rem">' +
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>' +
+      '<span class="calendar-panel__title" style="flex:1">Нет событий на сегодня</span></div>';
+    return;
+  }
+
+  const ev = calendarEvents[calendarEventIndex % calendarEvents.length];
+  const many = calendarEvents.length > 1;
+  root.innerHTML =
+    '<div class="calendar-panel">' +
+    '<div class="calendar-panel__bar" style="background-color:' +
+    escapeAttr(ev.color) +
+    '"></div>' +
+    '<div class="calendar-panel__body">' +
+    '<span class="calendar-panel__title">' +
+    escapeHtml(ev.title) +
+    '</span>' +
+    '<div class="calendar-panel__meta">' +
+    escapeHtml(ev.time) +
+    (many
+      ? ' <span>• ' + (calendarEventIndex + 1) + '/' + calendarEvents.length + '</span>'
+      : '') +
+    '</div></div>' +
+    (many
+      ? '<button type="button" class="calendar-panel__next" id="calendarWidgetNext" title="Следующее событие" aria-label="Следующее"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg></button>'
+      : '') +
+    '</div>';
+
+  const next = many ? document.getElementById('calendarWidgetNext') : null;
+  if (next) {
+    next.addEventListener('click', () => {
+      calendarEventIndex = (calendarEventIndex + 1) % calendarEvents.length;
+      renderCalendarWidget();
+    });
+  }
+}
+
 function applyBackground() {
   const el = $('pageBg');
   if (app.settings.changeBgDaily) pickDailyPreset();
@@ -962,7 +1125,16 @@ function applyBackground() {
     if (String(bg.value).startsWith('linear')) el.style.background = bg.value;
     else el.style.backgroundColor = bg.value;
   } else if (bg.type === 'image' || bg.type === 'preset') {
-    el.style.backgroundImage = 'url("' + bg.value.replace(/"/g, '\\"') + '")';
+    const v = String(bg.value || '');
+    // Маркер синка без локального data URL — не подставлять в url(), иначе chrome-extension://…/__VB_CUSTOM_BG__
+    if (
+      bg.type === 'image' &&
+      (v === CUSTOM_BG_MARKER || (!v.startsWith('data:') && !/^https?:\/\//i.test(v)))
+    ) {
+      el.style.backgroundColor = '#0a0a0a';
+      return;
+    }
+    el.style.backgroundImage = 'url("' + v.replace(/"/g, '\\"') + '")';
     el.style.backgroundSize = 'cover';
     el.style.backgroundPosition = 'center';
   } else {
@@ -1718,7 +1890,22 @@ function renderSettingsPanels() {
     '<label class="settings-check"><input type="checkbox" id="chkNewTab"' +
     (s.openLinksInNewTab ? ' checked' : '') +
     '/><span>Открывать ссылки в новой вкладке</span></label>' +
+    '<label class="settings-check"><input type="checkbox" id="chkCalendar"' +
+    (s.showCalendar !== false ? ' checked' : '') +
+    '/><span>Показывать виджет Google Календаря</span></label>' +
     '</section>' +
+    (s.showCalendar !== false
+      ? '<section class="mb-6">' +
+        '<h2 class="settings-section-title">Google Календарь</h2>' +
+        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">События на сегодня из основного календаря (primary). Используется тот же OAuth Client ID, что и для Google Drive, плюс scope <code style="font-size:0.75rem">calendar.readonly</code> в manifest. В консоли Google Cloud включите <strong>Google Calendar API</strong>.</p>' +
+        '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem">' +
+        (s.googleCalendarEnabled
+          ? '<span class="settings-calendar-status settings-calendar-status--ok">Календарь подключен</span>' +
+            '<button type="button" class="backup-btn" id="btnCalendarSettingsDisconnect">Отключить</button>'
+          : '<span class="settings-calendar-status">Не подключен</span>' +
+            '<button type="button" class="backup-btn" id="btnCalendarSettingsConnect">Подключить</button>') +
+        '</div></section>'
+      : '') +
     (s.showSearch !== false
       ? '<section class="mb-6"><h2 class="settings-section-title">Поисковая система</h2><div class="engine-grid">' +
         SEARCH_ENGINES.map(
@@ -1844,8 +2031,16 @@ function wireSettingsAppearance(totalPages) {
     persist();
     renderSettingsIfOpen();
   });
-  ['chkBar', 'chkSearch', 'chkCtx', 'chkInfo', 'chkStab', 'chkNewTab'].forEach((id, i) => {
-    const keys = ['showBookmarksBar', 'showSearch', 'showContextSuggestions', 'showInfoPanel', 'showStabilityInfo', 'openLinksInNewTab'];
+  ['chkBar', 'chkSearch', 'chkCtx', 'chkInfo', 'chkStab', 'chkNewTab', 'chkCalendar'].forEach((id, i) => {
+    const keys = [
+      'showBookmarksBar',
+      'showSearch',
+      'showContextSuggestions',
+      'showInfoPanel',
+      'showStabilityInfo',
+      'openLinksInNewTab',
+      'showCalendar',
+    ];
     $(id).addEventListener('change', () => {
       app.settings[keys[i]] = $(id).checked;
       persist();
@@ -1853,8 +2048,25 @@ function wireSettingsAppearance(totalPages) {
       if (keys[i] === 'openLinksInNewTab') {
         renderBookmarksBar();
       }
+      if (keys[i] === 'showCalendar') {
+        renderCalendarWidget();
+      }
     });
   });
+  const btnCalConn = document.getElementById('btnCalendarSettingsConnect');
+  if (btnCalConn) btnCalConn.addEventListener('click', () => void connectGoogleCalendar());
+  const btnCalDis = document.getElementById('btnCalendarSettingsDisconnect');
+  if (btnCalDis) {
+    btnCalDis.addEventListener('click', () => {
+      app.settings.googleCalendarEnabled = false;
+      stopCalendarRotation();
+      calendarEvents = [];
+      void persist().then(() => {
+        renderSettingsIfOpen();
+        renderCalendarWidget();
+      });
+    });
+  }
   document.querySelectorAll('[data-engine-pick]').forEach((b) => {
     b.addEventListener('click', () => {
       app.settings.searchEngine = b.getAttribute('data-engine-pick');
@@ -2043,6 +2255,7 @@ function renderAll() {
   renderContextSuggestions();
   renderInfoPanel();
   renderGrid();
+  renderCalendarWidget();
 }
 
 /* --- Browser chrome modals --- */
@@ -2213,14 +2426,30 @@ function onGlobalClick(e) {
   renderHeader();
 }
 
+function scheduleWhenIdle(fn, timeoutMs = 2500) {
+  if (typeof requestIdleCallback !== 'undefined') {
+    requestIdleCallback(() => fn(), { timeout: timeoutMs });
+  } else {
+    setTimeout(fn, 0);
+  }
+}
+
 async function init() {
-  await loadState();
-  if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
-    const su = await VisualBookmarksApi.getStoredUser();
-    if (su) app.user = normalizeServerUser(su);
+  let cryptSession = { hasToken: false, user: null };
+  await Promise.all([
+    loadState(),
+    typeof VisualBookmarksApi !== 'undefined'
+      ? VisualBookmarksApi.getSessionForNewTab().then((s) => {
+          cryptSession = s;
+        })
+      : Promise.resolve(),
+  ]);
+  if (cryptSession.hasToken && cryptSession.user) {
+    app.user = normalizeServerUser(cryptSession.user);
   }
 
   $('loader').classList.add('is-hidden');
+  renderAll();
 
   document.addEventListener('click', onGlobalClick);
 
@@ -2521,8 +2750,12 @@ async function init() {
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      pullRemoteMerge()
+    if (document.visibilityState !== 'visible') return;
+    scheduleWhenIdle(() => {
+      if (app.settings.googleCalendarEnabled) void refreshCalendarEvents();
+    });
+    scheduleWhenIdle(() => {
+      void pullRemoteMerge()
         .catch(() => {})
         .finally(async () => {
           renderAll();
@@ -2530,25 +2763,36 @@ async function init() {
             await restartServerPeriodicPull();
           }
         });
-    }
+    });
   });
 
-  renderAll();
+  $('btnCalendarModalConnect')?.addEventListener('click', () => void connectGoogleCalendar());
 
-  void pullRemoteMerge()
-    .catch(() => {})
-    .finally(async () => {
-      renderAll();
-      await restartServerPeriodicPull();
-      try {
-        if (await enrichFaviconBackgrounds()) {
-          touchUpdated();
-          await saveLocal();
-          renderAll();
-          debouncedPush();
-        }
-      } catch (_) {}
-    });
+  setInterval(() => {
+    if (app.settings.googleCalendarEnabled) void refreshCalendarEvents();
+  }, 60 * 1000);
+
+  scheduleWhenIdle(() => void refreshCalendarEvents());
+  scheduleWhenIdle(() => {
+    void pullRemoteMerge()
+      .catch(() => {})
+      .finally(async () => {
+        renderAll();
+        await restartServerPeriodicPull();
+        scheduleWhenIdle(() => {
+          void (async () => {
+            try {
+              if (await enrichFaviconBackgrounds()) {
+                touchUpdated();
+                await saveLocal();
+                renderAll();
+                debouncedPush();
+              }
+            } catch (_) {}
+          })();
+        }, 4000);
+      });
+  });
 }
 
 init();

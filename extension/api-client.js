@@ -97,6 +97,21 @@
     return !!t;
   }
 
+  /** Один вызов storage для новой вкладки (параллельно с loadState основного JSON). */
+  async function getSessionForNewTab() {
+    const x = await storageGet([K.TOKEN, K.USER]);
+    const token = x[K.TOKEN];
+    const has = !!(token && String(token).trim());
+    let user = null;
+    const raw = x[K.USER];
+    if (raw) {
+      try {
+        user = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch (_) {}
+    }
+    return { hasToken: has, user };
+  }
+
   async function requestHostPermissionForBase(baseUrl) {
     if (!baseUrl || typeof chrome === 'undefined' || !chrome.permissions) return true;
     let origin;
@@ -278,6 +293,7 @@
     getLoginPageUrl,
     setServerUrl,
     hasToken,
+    getSessionForNewTab,
     getAccessToken,
     getStoredUser,
     login,

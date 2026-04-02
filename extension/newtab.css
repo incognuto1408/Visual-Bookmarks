@@ -65,7 +65,8 @@ body {
   pointer-events: none;
 }
 
-.app > :not(.page-bg):not(.page-overlay) {
+/* #calendarWidgetRoot — position: fixed снизу справа; не задавать ему relative */
+.app > :not(.page-bg):not(.page-overlay):not(#calendarWidgetRoot) {
   position: relative;
   z-index: 2;
 }
@@ -1731,4 +1732,197 @@ html[data-theme="dark"] .bm-settings-row__title {
 
 html[data-theme="dark"] .modal-close--light {
   color: #a1a1aa;
+}
+
+/* --- Google Calendar (референс: плавающий виджет + модалка) --- */
+.calendar-widget-root {
+  position: fixed;
+  right: 1rem;
+  /* выше нижней панели (.bottom-bar), не перекрывается ею (у панели z-index 30) */
+  bottom: 5.5rem;
+  z-index: 35;
+  max-width: min(18rem, calc(100vw - 2rem));
+  pointer-events: auto;
+}
+
+.calendar-widget-root.is-hidden {
+  display: none !important;
+}
+
+.calendar-connect-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: var(--radius-lg);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.calendar-connect-pill:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+
+.calendar-connect-pill svg {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.calendar-panel {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: var(--radius-lg);
+  max-width: 18rem;
+}
+
+.calendar-panel__bar {
+  width: 0.375rem;
+  height: 2rem;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.calendar-panel__body {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+}
+
+.calendar-panel__title {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.92);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calendar-panel__meta {
+  font-size: 0.6875rem;
+  color: rgba(255, 255, 255, 0.55);
+  margin-top: 0.125rem;
+}
+
+.calendar-panel__next {
+  flex-shrink: 0;
+  padding: 0.25rem;
+  border: none;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.45);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.calendar-panel__next:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.modal-dialog--calendar-connect {
+  position: relative;
+  width: 100%;
+  max-width: 22rem;
+  margin: 1rem;
+  padding: 1.5rem;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: var(--radius-xl);
+  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.55);
+}
+
+.calendar-connect-modal {
+  text-align: center;
+  padding-top: 0.25rem;
+}
+
+.calendar-connect-modal__icon {
+  width: 4rem;
+  height: 4rem;
+  margin: 0 auto 1rem;
+  border-radius: 9999px;
+  background: rgba(59, 130, 246, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.calendar-connect-modal__title {
+  margin: 0 0 0.5rem;
+  font-size: 1.125rem;
+  font-weight: 500;
+  color: #fafafa;
+}
+
+.calendar-connect-modal__text {
+  margin: 0 0 1.5rem;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: #a1a1aa;
+}
+
+.btn--google-calendar {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border: none;
+  border-radius: var(--radius-lg);
+  background: #2563eb;
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn--google-calendar:hover {
+  background: #1d4ed8;
+}
+
+.btn--google-calendar__g {
+  flex-shrink: 0;
+}
+
+.settings-calendar-status {
+  font-size: 0.875rem;
+  color: #6b7280;
+}
+
+.settings-calendar-status--ok {
+  color: #16a34a;
+}
+
+.calendar-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+html[data-theme="dark"] .settings-calendar-status {
+  color: #a1a1aa;
+}
+
+html[data-theme="dark"] .settings-calendar-status--ok {
+  color: #4ade80;
 }

@@ -17,8 +17,11 @@
     "service_worker": "background.js"
   },
   "oauth2": {
-    "client_id": "REPLACE_WITH_YOUR_CHROME_EXTENSION_CLIENT_ID.apps.googleusercontent.com",
-    "scopes": ["https://www.googleapis.com/auth/drive.appdata"]
+    "client_id": "315927633254-knl0p5tu8uu0kli79pe6c3154tuahctb.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.appdata",
+      "https://www.googleapis.com/auth/calendar.readonly"
+    ]
   },
   "icons": {
     "48": "icons/icon48.png",
