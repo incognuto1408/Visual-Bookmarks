@@ -370,6 +370,11 @@ let notifications = MOCK_NOTIFICATIONS.map((n) => ({ ...n }));
 let bmAutoColor = false;
 /** Пользователь вручную менял цвет в модалке (иначе при «Добавить» цвет берётся с favicon) */
 let bmColorUserTouched = false;
+/** Ввод в поле описания — не перезаписывать авто-подставленным заголовком страницы */
+let bmDescUserEdited = false;
+let bmDescAutofillTimer = null;
+let bmDescAutofillGen = 0;
+const BM_DESC_AUTOFILL_DEBOUNCE_MS = 550;
 
 /** События primary-календаря на сегодня (Google Calendar API) */
 let calendarEvents = [];
@@ -447,6 +452,128 @@ function defaultBookmarkTitleFromUrl(canonicalUrl) {
   }
 }
 
+function tabUrlMatchesBookmarkEntry(tabUrl, bookmarkCanonical) {
+  try {
+    const t = new URL(tabUrl);
+    const b = new URL(bookmarkCanonical);
+    if (t.origin !== b.origin) return false;
+    const norm = (p) => {
+      const x = (p || '/').replace(/\/$/, '');
+      return x === '' ? '/' : x;
+    };
+    const bt = norm(b.pathname);
+    const tt = norm(t.pathname);
+    if (bt === '/') return true;
+    return tt === bt || tt.startsWith(bt + '/');
+  } catch {
+    return false;
+  }
+}
+
+function isUnusableAutoBookmarkTitle(t) {
+  const s = String(t || '').trim().toLowerCase();
+  if (s.length < 2) return true;
+  if (/^https?:\/\//i.test(s)) return true;
+  const bad = [
+    'new tab',
+    'новая вкладка',
+    'нова вкладка',
+    'about:blank',
+    'chrome://',
+    'visual bookmarks',
+  ];
+  return bad.some((b) => s.includes(b));
+}
+
+function tryGetBookmarkTitleFromOpenTab(canonicalUrl) {
+  return new Promise((resolve) => {
+    if (!isExtensionContext() || typeof chrome === 'undefined' || !chrome.tabs?.query) {
+      resolve(null);
+      return;
+    }
+    chrome.tabs.query({ currentWindow: true }, (tabs) => {
+      if (chrome.runtime.lastError || !tabs?.length) {
+        resolve(null);
+        return;
+      }
+      let best = null;
+      for (const tab of tabs) {
+        if (!tab.url || !/^https?:/i.test(tab.url)) continue;
+        if (!tabUrlMatchesBookmarkEntry(tab.url, canonicalUrl)) continue;
+        const title = (tab.title || '').replace(/\s+/g, ' ').trim();
+        if (!title || isUnusableAutoBookmarkTitle(title)) continue;
+        const len = new URL(tab.url).pathname.length;
+        if (!best || len > best.len) best = { title, len };
+      }
+      resolve(best ? best.title : null);
+    });
+  });
+}
+
+function scheduleBookmarkDescAutofill() {
+  if (editingBookmarkId) return;
+  clearTimeout(bmDescAutofillTimer);
+  bmDescAutofillTimer = setTimeout(() => {
+    bmDescAutofillTimer = null;
+    void tryAutofillBookmarkDescFromPage();
+  }, BM_DESC_AUTOFILL_DEBOUNCE_MS);
+}
+
+async function tryAutofillBookmarkDescFromPage() {
+  if (editingBookmarkId || bmDescUserEdited) return;
+  const raw = $('bmUrl').value;
+  const url = tryNormalizeBookmarkUrl(raw);
+  if (!url) return;
+  if ($('bmDesc').value.trim() !== '') return;
+  const gen = ++bmDescAutofillGen;
+
+  let text = '';
+  let source = '';
+  if (isExtensionContext() && typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+    const r = await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'VB_GET_PAGE_SNIPPET', pageUrl: url }, (resp) => {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false });
+            return;
+          }
+          resolve(resp && typeof resp === 'object' ? resp : { ok: false });
+        });
+      } catch {
+        resolve({ ok: false });
+      }
+    });
+    if (gen !== bmDescAutofillGen) return;
+    if (editingBookmarkId || bmDescUserEdited || $('bmDesc').value.trim() !== '') return;
+    const d = r && r.ok && typeof r.description === 'string' ? r.description.trim() : '';
+    if (d && !isUnusableAutoBookmarkTitle(d)) {
+      text = d;
+      source = typeof r.source === 'string' ? r.source : 'html';
+    }
+  }
+
+  if (!text) {
+    const tabTitle = await tryGetBookmarkTitleFromOpenTab(url);
+    if (gen !== bmDescAutofillGen) return;
+    if (editingBookmarkId || bmDescUserEdited || $('bmDesc').value.trim() !== '') return;
+    if (tabTitle && !isUnusableAutoBookmarkTitle(tabTitle)) {
+      text = tabTitle;
+      source = 'tab-title';
+    }
+  }
+
+  if (!text) return;
+  $('bmDesc').value = text.slice(0, 500);
+  if (source) {
+    $('bmDesc').setAttribute('data-vb-desc-source', source);
+    $('bmDesc').title = tr('bm.descAutofillHint') + ' (' + source + ')';
+  } else {
+    $('bmDesc').removeAttribute('data-vb-desc-source');
+    $('bmDesc').removeAttribute('title');
+  }
+  updateBmPreview();
+}
+
 function hostFromUrl(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, '');
@@ -508,6 +635,20 @@ function getFaviconCached(pageUrl) {
   });
 }
 
+/** Синхронно: уже загруженная в этой вкладке иконка — без мигания при каждом renderGrid */
+function faviconDataUrlFromSessionCache(pageUrl) {
+  const key = String(pageUrl || '').trim();
+  if (!key) return null;
+  const hit = vbFaviconSessionCache.get(key);
+  if (hit && hit.ok && typeof hit.dataUrl === 'string' && hit.dataUrl.startsWith('data:')) return hit.dataUrl;
+  return null;
+}
+
+function bookmarkTileIconSrc(pageUrl, view) {
+  if (view === 'screenshots') return screenshotThumb(pageUrl);
+  return faviconDataUrlFromSessionCache(pageUrl) || fallbackIconUrl();
+}
+
 function wireTileImageFallback(img) {
   const fb = fallbackIconUrl();
   img.addEventListener('error', function onTileImgErr() {
@@ -534,7 +675,9 @@ function wireTileFaviconLazyLoad(gridEl) {
     const pageUrl = img.getAttribute('data-vb-favicon');
     if (!pageUrl) return;
     getFaviconCached(pageUrl).then((fr) => {
-      if (fr.ok && fr.dataUrl && img.isConnected) img.src = fr.dataUrl;
+      if (!fr.ok || !fr.dataUrl || !img.isConnected) return;
+      if (img.src === fr.dataUrl) return;
+      img.src = fr.dataUrl;
     });
   });
 }
@@ -2262,7 +2405,7 @@ function renderGrid() {
     const tc = contrastColor(tileBg);
     const bg = tileBg.startsWith('linear') ? 'background:' + tileBg : 'background-color:' + tileBg;
     const view = app.settings.bookmarkView || 'icons';
-    const imgSrc = view === 'screenshots' ? screenshotThumb(b.url) : fallbackIconUrl();
+    const imgSrc = bookmarkTileIconSrc(b.url, view);
     const imgClass = view === 'screenshots' ? 'bm-card__img bm-card__img--shot' : 'bm-card__img bm-card__img--icon';
     const favLazyAttr = view !== 'screenshots' ? ' data-vb-favicon="' + escapeAttr(b.url) + '"' : '';
     html +=
@@ -2426,11 +2569,17 @@ function openBookmarkModal(bm) {
   editingBookmarkId = bm ? bm.id : null;
   bmAutoColor = false;
   bmColorUserTouched = false;
+  bmDescUserEdited = false;
+  bmDescAutofillGen++;
+  clearTimeout(bmDescAutofillTimer);
+  bmDescAutofillTimer = null;
   $('bookmarkModalTitle').textContent = bm ? tr('bm.titleEdit') : tr('bm.titleAdd');
   $('bmSubmit').textContent = bm ? tr('bm.save') : tr('bm.add');
   $('bmTitle').value = bm?.title || '';
   $('bmUrl').value = bm?.url || '';
   $('bmDesc').value = bm?.description || '';
+  $('bmDesc').removeAttribute('data-vb-desc-source');
+  $('bmDesc').removeAttribute('title');
   const rawCol = bm?.backgroundColor;
   let col = DEFAULT_TILE_BG;
   if (rawCol === FAVICON_BG) {
@@ -2472,6 +2621,7 @@ function openBookmarkModal(bm) {
     recentSec.classList.remove('is-hidden');
     recentSec.setAttribute('aria-hidden', 'false');
     loadRecentTabsForBookmarkModal();
+    scheduleBookmarkDescAutofill();
   }
   showModal('modalBookmark');
 }
@@ -3686,7 +3836,16 @@ async function init() {
     updateBmPreview();
   });
   $('bmTitle').addEventListener('input', updateBmPreview);
-  $('bmUrl').addEventListener('input', updateBmPreview);
+  $('bmDesc').addEventListener('input', () => {
+    bmDescUserEdited = true;
+    $('bmDesc').removeAttribute('title');
+    $('bmDesc').removeAttribute('data-vb-desc-source');
+    updateBmPreview();
+  });
+  $('bmUrl').addEventListener('input', () => {
+    updateBmPreview();
+    scheduleBookmarkDescAutofill();
+  });
 
   $('bmAutoColor').addEventListener('click', async () => {
     const url = $('bmUrl').value.trim();

@@ -49,6 +49,8 @@
   "bm.placeholderTitle": "Необов’язково — домен з URL",
   "bm.placeholderUrl": "https://google.com",
   "bm.placeholderDesc": "Пошукова система",
+  "bm.descAutofillExplain": "Якщо порожньо — підставимо текст зі сторінки: meta description, Open Graph / Twitter, далі заголовок сторінки; якщо не вийде — заголовок відкритої вкладки.",
+  "bm.descAutofillHint": "Джерело тексту опису",
   "bm.previewDefault": "Назва",
   "del.barLabel": "Видалення закладки…",
   "del.barHint": "Натисніть, щоб скасувати",

@@ -598,9 +598,106 @@ function getOrFetchFavicon(pageUrl) {
   return p;
 }
 
+const PAGE_TITLE_FETCH_MS = 9000;
+const PAGE_TITLE_MAX_BYTES = 120000;
+
+function parseTitleFromHtmlString(html) {
+  if (!html || typeof html !== 'string') return '';
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const el = doc.querySelector('title');
+    if (el) {
+      const s = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (s) return s;
+    }
+  } catch (_) {}
+  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!m) return '';
+  let s = m[1].replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ');
+  s = s.replace(/<[^>]+>/g, ' ');
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Текст для поля «описание» закладки: сначала SEO/соц. описание, в конце &lt;title&gt;.
+ * @returns {{ text: string; source: string }}
+ */
+function parseBookmarkSnippetFromHtml(html) {
+  if (!html || typeof html !== 'string') return { text: '', source: '' };
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const metaContent = (sel) => {
+      const el = doc.querySelector(sel);
+      const c = el?.getAttribute('content');
+      if (c == null) return '';
+      const s = String(c).replace(/\s+/g, ' ').trim();
+      return s.length >= 2 ? s : '';
+    };
+    let t = metaContent('meta[name="description"]');
+    if (t) return { text: t, source: 'meta-description' };
+    t = metaContent('meta[property="og:description"]');
+    if (t) return { text: t, source: 'og-description' };
+    t = metaContent('meta[name="twitter:description"]');
+    if (t) return { text: t, source: 'twitter-description' };
+  } catch (_) {}
+  const title = parseTitleFromHtmlString(html);
+  if (title) return { text: title, source: 'html-title' };
+  return { text: '', source: '' };
+}
+
+async function fetchPageSnippetForBookmark(pageUrl) {
+  let u;
+  try {
+    u = new URL(pageUrl);
+  } catch {
+    return { ok: false };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return { ok: false };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PAGE_TITLE_FETCH_MS);
+  let res;
+  try {
+    res = await fetch(u.href, {
+      method: 'GET',
+      redirect: 'follow',
+      credentials: 'omit',
+      cache: 'default',
+      signal: ctrl.signal,
+      headers: { Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' },
+    });
+  } catch {
+    return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res || !res.ok) return { ok: false };
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  if (!ct.includes('text/html') && !ct.includes('application/xhtml')) return { ok: false };
+  try {
+    const buf = await res.arrayBuffer();
+    const slice = buf.byteLength > PAGE_TITLE_MAX_BYTES ? buf.slice(0, PAGE_TITLE_MAX_BYTES) : buf;
+    const html = new TextDecoder('utf-8', { fatal: false }).decode(slice);
+    const { text, source } = parseBookmarkSnippetFromHtml(html);
+    if (!text) return { ok: false };
+    return { ok: true, description: text.slice(0, 500), source };
+  } catch {
+    return { ok: false };
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'VB_GET_PAGE_SNIPPET') {
+    void fetchPageSnippetForBookmark(message.pageUrl).then((r) => {
+      try {
+        sendResponse(r);
+      } catch (e) {
+        console.warn('[VB Snippet] sendResponse:', e?.message || e);
+      }
+    });
+    return true;
+  }
   if (message?.type === 'VB_CALENDAR_SW_WAKE') {
     sendResponse({ ok: true });
     return false;

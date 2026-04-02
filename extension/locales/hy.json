@@ -49,6 +49,8 @@
   "bm.placeholderTitle": "Կամայական — դոմենը URL-ից",
   "bm.placeholderUrl": "https://google.com",
   "bm.placeholderDesc": "Որոնման համակարգ",
+  "bm.descAutofillExplain": "Դատարկ լինելու դեպքում՝ տեքստը վերցնում ենք էջից՝ meta description, Open Graph / Twitter, հետո էջի վերնագիր. եթե չստացվի՝ բաց ներդիրի վերնագիր։",
+  "bm.descAutofillHint": "Նկարագրության տեքստի աղբյուր",
   "bm.previewDefault": "Անվանում",
   "del.barLabel": "Էջանիշի ջնջում…",
   "del.barHint": "Սեղմեք չեղարկելու համար",

@@ -49,6 +49,8 @@
   "bm.placeholderTitle": "Optional — site domain if empty",
   "bm.placeholderUrl": "https://google.com",
   "bm.placeholderDesc": "Search engine",
+  "bm.descAutofillExplain": "If empty, we fill from the page: meta description, Open Graph / Twitter, then the page title; if that fails, the open tab’s title.",
+  "bm.descAutofillHint": "Description text source",
   "bm.previewDefault": "Title",
   "del.barLabel": "Deleting bookmark…",
   "del.barHint": "Click to cancel",
