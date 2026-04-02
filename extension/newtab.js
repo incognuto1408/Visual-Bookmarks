@@ -42,6 +42,12 @@ const BOOT_CACHE_VERSION = 1;
 const SYNC_DEBOUNCE_MS = 2500;
 
 let pageBgObjectUrl = null;
+/** Подпись последнего применённого фона — без повторной очистки style при лишних renderAll() */
+let pageBgApplySig = '';
+/** Инкремент при уходе с кастомного IDB-фона, чтобы отбросить поздний ответ async */
+let idbBgPaintGen = 0;
+/** Один активный запрос фона из IndexedDB (второй renderAll до готовности не сбрасывает DOM) */
+let idbBgPaintPromise = null;
 
 function revokePageBgObjectUrl() {
   if (pageBgObjectUrl) {
@@ -89,14 +95,16 @@ async function migrateAndRemoveLegacyCustomBgFromChromeStorage() {
   });
 }
 
-async function paintCustomBackgroundFromIdb(el) {
+async function paintCustomBackgroundFromIdb(el, gen) {
   if (!el) return;
+  if (typeof gen === 'number' && gen !== idbBgPaintGen) return;
   if (typeof VisualBookmarksCustomBg === 'undefined') {
     el.style.backgroundColor = '#0a0a0a';
     return;
   }
   try {
     const blob = await VisualBookmarksCustomBg.loadBlob();
+    if (typeof gen === 'number' && gen !== idbBgPaintGen) return;
     if (!blob) {
       el.style.backgroundColor = '#0a0a0a';
       return;
@@ -108,6 +116,7 @@ async function paintCustomBackgroundFromIdb(el) {
     el.style.backgroundPosition = 'center';
   } catch (e) {
     console.warn('VB: фон из IndexedDB', e);
+    if (typeof gen === 'number' && gen !== idbBgPaintGen) return;
     el.style.backgroundColor = '#0a0a0a';
   }
 }
@@ -270,7 +279,11 @@ let app = {
 };
 
 let editingBookmarkId = null;
-let deletingBookmarkId = null;
+let pendingDeleteBookmarkId = null;
+let pendingDeleteProgress = 0;
+let pendingDeleteIntervalId = null;
+let pendingDeleteStartMs = 0;
+const BOOKMARK_DELETE_COUNTDOWN_MS = 3000;
 let authMode = 'login';
 let settingsTab = 'appearance';
 let bgPage = 0;
@@ -278,7 +291,6 @@ let engineMenuOpen = false;
 let profileMenuOpen = false;
 let draggedGridIndex = null;
 let dragOverGridIndex = null;
-let openCardMenuId = null;
 let stabilityExpanded = false;
 let stabilityNotifOpen = false;
 let notifications = MOCK_NOTIFICATIONS.map((n) => ({ ...n }));
@@ -494,15 +506,23 @@ function mergeSettings(base, patch) {
   return out;
 }
 
+/** Макс. длина строки `background.value` для type=image при внешней передаче (синк / экспорт): иначе считаем встроенными данными. */
+const MAX_EXPORT_BG_VALUE_LEN = 512;
+
 /**
- * Для синка / API: без data URL. Свой фон — маркер; пиксели только в IndexedDB на устройстве.
+ * Для синка / API / экспорт: без data/blob URL и без огромных строк. Свой фон — маркер; пиксели только в IndexedDB на устройстве.
  */
 function stripEmbeddedBackgroundForExternal(settings) {
   if (!settings || typeof settings !== 'object') return settings;
   const out = { ...settings };
   const bg = out.background;
   if (bg && bg.type === 'image' && typeof bg.value === 'string') {
-    if (bg.value.startsWith('data:') || bg.value === CUSTOM_BG_MARKER) {
+    const v = bg.value;
+    if (v === CUSTOM_BG_MARKER) {
+      out.background = { type: 'image', value: CUSTOM_BG_MARKER };
+    } else if (v.startsWith('data:') || v.startsWith('blob:')) {
+      out.background = { type: 'image', value: CUSTOM_BG_MARKER };
+    } else if (!/^https?:\/\//i.test(v) && v.length > MAX_EXPORT_BG_VALUE_LEN) {
       out.background = { type: 'image', value: CUSTOM_BG_MARKER };
     }
   }
@@ -702,6 +722,26 @@ function bookmarksWithoutFaviconPayload(bookmarks) {
   });
 }
 
+/** Экспорт JSON: без data URL и без тяжёлых полей в закладках */
+function bookmarksForExport(bookmarks) {
+  return bookmarksWithoutFaviconPayload(bookmarks).map((b) => {
+    const o = { ...b };
+    if (typeof o.backgroundColor === 'string' && o.backgroundColor.startsWith('data:')) {
+      o.backgroundColor = DEFAULT_TILE_BG;
+    }
+    if (typeof o.description === 'string' && o.description.startsWith('data:')) {
+      o.description = '';
+    }
+    if (typeof o.title === 'string' && o.title.startsWith('data:')) {
+      o.title = '';
+    }
+    if (typeof o.url === 'string' && o.url.startsWith('data:')) {
+      o.url = '';
+    }
+    return o;
+  });
+}
+
 async function saveLocal() {
   await flushTransientDataUrlBackgroundToIdbIfAny();
   const payload = {
@@ -738,16 +778,11 @@ async function saveLocal() {
 }
 
 function exportJsonString() {
-  const settingsCopy = JSON.parse(JSON.stringify(app.settings));
-  const ibg = settingsCopy.background;
-  if (ibg?.type === 'image' && typeof ibg.value === 'string' && ibg.value.startsWith('data:')) {
-    settingsCopy.background = { type: 'image', value: CUSTOM_BG_MARKER };
-  }
+  const settingsCopy = stripEmbeddedBackgroundForExternal(JSON.parse(JSON.stringify(app.settings)));
   return JSON.stringify(
     {
-      bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
+      bookmarks: bookmarksForExport(app.bookmarks),
       settings: settingsCopy,
-      user: app.user,
       updatedAt: app.updatedAt,
       version: 2,
     },
@@ -768,6 +803,9 @@ function importFromJson(text) {
 function resetDefaults() {
   clearBootCache();
   void abandonCustomBackgroundBlobIfAny();
+  pageBgApplySig = '';
+  idbBgPaintGen++;
+  idbBgPaintPromise = null;
   app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
   app.settings = { ...DEFAULT_SETTINGS };
   app.user = null;
@@ -1037,7 +1075,7 @@ async function restartServerPeriodicPull() {
 
 /** После любого pull с сервера — перечитать флаг календаря и при необходимости события (другой ПК мог изменить настройки). */
 function scheduleCalendarRefreshAfterServerPull() {
-  scheduleWhenIdle(() => void refreshCalendarEvents({ force: true }));
+  setTimeout(() => void refreshCalendarEvents({ force: true }), 0);
 }
 
 /** @returns {Promise<boolean>} нужен ли полный renderAll снаружи */
@@ -1275,8 +1313,26 @@ async function refreshCalendarEventsInPage(dayKey, pageOpts = {}) {
 }
 
 /**
- * Кэш 1 ч + тот же календарный день → без сети. Запрос выполняется в service worker, страница не блокируется.
- * @param {{ force?: boolean }} opts — force после подключения календаря
+ * До первого renderAll: подставить события из chrome.storage за текущий календарный день (без проверки TTL).
+ */
+async function hydrateCalendarEventsFromCacheIfPossible() {
+  if (!app.settings.googleCalendarEnabled || app.settings.showCalendar === false) return;
+  const dayKey = calendarDayKeyForCache();
+  const cached = await new Promise((resolve) => {
+    storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
+      resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
+    });
+  });
+  if (cached && cached.dayKey === dayKey && Array.isArray(cached.events) && cached.events.length > 0) {
+    stopCalendarRotation();
+    calendarEvents = cached.events;
+    calendarEventIndex = 0;
+  }
+}
+
+/**
+ * Кэш 1 ч + тот же календарный день → без сети. Запрос в worker / сеть — stale-while-revalidate: не затирать виджет пустым «ожиданием».
+ * @param {{ force?: boolean }} opts — force после подключения / pull: всё равно показываем кэш за сегодня, пока идёт запрос
  */
 async function refreshCalendarEvents(opts = {}) {
   const force = !!opts.force;
@@ -1291,20 +1347,28 @@ async function refreshCalendarEvents(opts = {}) {
   }
 
   const dayKey = calendarDayKeyForCache();
-
-  if (!force) {
-    const cached = await new Promise((resolve) => {
-      storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
-        resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
-      });
+  const cached = await new Promise((resolve) => {
+    storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
+      resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
     });
-    if (cached && typeof cached.at === 'number' && cached.dayKey === dayKey && Array.isArray(cached.events)) {
-      const effTtl = cached.events.length > 0 ? CALENDAR_CACHE_TTL_MS : CALENDAR_EMPTY_CACHE_TTL_MS;
-      if (Date.now() - cached.at < effTtl) {
-        applyCalendarResult(cached.events);
-        return;
-      }
+  });
+
+  if (!force && cached && typeof cached.at === 'number' && cached.dayKey === dayKey && Array.isArray(cached.events)) {
+    const effTtl = cached.events.length > 0 ? CALENDAR_CACHE_TTL_MS : CALENDAR_EMPTY_CACHE_TTL_MS;
+    if (Date.now() - cached.at < effTtl) {
+      applyCalendarResult(cached.events);
+      return;
     }
+  }
+
+  if (
+    cached &&
+    cached.dayKey === dayKey &&
+    Array.isArray(cached.events) &&
+    cached.events.length > 0 &&
+    calendarEvents.length === 0
+  ) {
+    applyCalendarResult(cached.events);
   }
 
   await new Promise((r) => setTimeout(r, 0));
@@ -1338,21 +1402,14 @@ async function refreshCalendarEvents(opts = {}) {
       return;
     }
     console.warn('Google Calendar (фон):', resp.error || 'нет ответа');
-    if (!force) {
-      const stale = await new Promise((resolve) => {
-        storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
-          resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
-        });
-      });
-      if (
-        stale &&
-        stale.dayKey === dayKey &&
-        Array.isArray(stale.events) &&
-        stale.events.length > 0
-      ) {
-        applyCalendarResult(stale.events);
-        return;
-      }
+    if (
+      cached &&
+      cached.dayKey === dayKey &&
+      Array.isArray(cached.events) &&
+      cached.events.length > 0
+    ) {
+      applyCalendarResult(cached.events);
+      return;
     }
     await refreshCalendarEventsInPage(dayKey, { force });
     return;
@@ -1491,10 +1548,34 @@ function renderCalendarWidget() {
   }
 }
 
+function computePageBgSignature(bg) {
+  if (!bg || typeof bg !== 'object') return '';
+  if (bg.type === 'color') return 'c:' + String(bg.value);
+  if (isCustomBackgroundMarker(bg)) return 'idb';
+  const v = String(bg.value || '');
+  if (bg.type === 'image' && v.startsWith('data:')) return 'd:' + v.length;
+  return 'i:' + v;
+}
+
 function applyBackground() {
   const el = $('pageBg');
   if (app.settings.changeBgDaily) pickDailyPreset();
   const bg = app.settings.background || DEFAULT_SETTINGS.background;
+  const sig = computePageBgSignature(bg);
+
+  if (sig === pageBgApplySig) {
+    if (sig !== 'idb') return;
+    if (pageBgObjectUrl && el.style.backgroundImage) return;
+    if (idbBgPaintPromise) return;
+  }
+
+  if (sig !== 'idb') {
+    idbBgPaintGen++;
+    idbBgPaintPromise = null;
+  }
+
+  pageBgApplySig = sig;
+
   el.style.backgroundImage = '';
   el.style.backgroundColor = '';
   el.style.background = '';
@@ -1505,9 +1586,11 @@ function applyBackground() {
   } else if (bg.type === 'image' || bg.type === 'preset') {
     const v = String(bg.value || '');
     if (isCustomBackgroundMarker(bg)) {
-      revokePageBgObjectUrl();
       el.style.backgroundColor = '#0a0a0a';
-      void paintCustomBackgroundFromIdb(el);
+      const gen = idbBgPaintGen;
+      idbBgPaintPromise = paintCustomBackgroundFromIdb(el, gen).finally(() => {
+        idbBgPaintPromise = null;
+      });
       return;
     }
     if (bg.type === 'image' && v.startsWith('data:')) {
@@ -1745,6 +1828,98 @@ function renderInfoPanel() {
   el.textContent = 'Информационная панель. Данные можно подключить к API позже.';
 }
 
+const DELETE_RING_R = 28;
+const DELETE_RING_C = 2 * Math.PI * DELETE_RING_R;
+
+function clearPendingDeleteInterval() {
+  if (pendingDeleteIntervalId != null) {
+    clearInterval(pendingDeleteIntervalId);
+    pendingDeleteIntervalId = null;
+  }
+}
+
+function updateDeleteProgressRings() {
+  const off = DELETE_RING_C * (1 - pendingDeleteProgress / 100);
+  document.querySelectorAll('[data-delete-ring="1"]').forEach((el) => {
+    el.setAttribute('stroke-dasharray', String(DELETE_RING_C));
+    el.setAttribute('stroke-dashoffset', String(off));
+  });
+}
+
+function cancelBookmarkDelete() {
+  clearPendingDeleteInterval();
+  pendingDeleteBookmarkId = null;
+  pendingDeleteProgress = 0;
+  const bar = document.getElementById('pendingDeleteBar');
+  if (bar) {
+    bar.classList.add('is-hidden');
+    bar.hidden = true;
+  }
+  renderGrid();
+}
+
+function finishPendingBookmarkDelete() {
+  const id = pendingDeleteBookmarkId;
+  clearPendingDeleteInterval();
+  pendingDeleteBookmarkId = null;
+  pendingDeleteProgress = 0;
+  const bar = document.getElementById('pendingDeleteBar');
+  if (bar) {
+    bar.classList.add('is-hidden');
+    bar.hidden = true;
+  }
+  if (!id) {
+    renderGrid();
+    return;
+  }
+  app.bookmarks = app.bookmarks.filter((b) => b.id !== id).map((b, i) => ({ ...b, order: i }));
+  void persist(true);
+}
+
+function startBookmarkDeleteCountdown(id) {
+  clearPendingDeleteInterval();
+  pendingDeleteBookmarkId = id;
+  pendingDeleteProgress = 0;
+  pendingDeleteStartMs = Date.now();
+  renderGrid();
+  renderPendingDeleteBar();
+  updateDeleteProgressRings();
+  pendingDeleteIntervalId = setInterval(() => {
+    if (pendingDeleteBookmarkId !== id) {
+      clearPendingDeleteInterval();
+      return;
+    }
+    const elapsed = Date.now() - pendingDeleteStartMs;
+    pendingDeleteProgress = Math.min((elapsed / BOOKMARK_DELETE_COUNTDOWN_MS) * 100, 100);
+    updateDeleteProgressRings();
+    if (elapsed >= BOOKMARK_DELETE_COUNTDOWN_MS) finishPendingBookmarkDelete();
+  }, 50);
+}
+
+function isBookmarkVisibleInGrid(id) {
+  const maxBm = effectiveMaxBookmarks();
+  const list = sortedBookmarks().slice(0, maxBm);
+  return list.some((b) => b.id === id);
+}
+
+function renderPendingDeleteBar() {
+  const bar = document.getElementById('pendingDeleteBar');
+  if (!bar) return;
+  if (!pendingDeleteBookmarkId) {
+    bar.classList.add('is-hidden');
+    bar.hidden = true;
+    return;
+  }
+  if (isBookmarkVisibleInGrid(pendingDeleteBookmarkId)) {
+    bar.classList.add('is-hidden');
+    bar.hidden = true;
+    return;
+  }
+  bar.classList.remove('is-hidden');
+  bar.hidden = false;
+  updateDeleteProgressRings();
+}
+
 /* --- Grid --- */
 function renderGrid() {
   const grid = $('bookmarksGrid');
@@ -1756,7 +1931,35 @@ function renderGrid() {
   const atMax = app.bookmarks.length >= maxBm;
   let html = '';
 
+  const ringOff = DELETE_RING_C * (1 - pendingDeleteProgress / 100);
+
   list.forEach((b, index) => {
+    if (pendingDeleteBookmarkId === b.id) {
+      html +=
+        '<div class="bm-card-wrap' +
+        (dragOverGridIndex === index && draggedGridIndex !== index ? ' is-drag-over' : '') +
+        '" data-grid-index="' +
+        index +
+        '" draggable="false">' +
+        '<div class="bm-card bm-card--delete-pending" tabindex="0" data-cancel-delete="1" role="button" aria-label="Отменить удаление">' +
+        '<div class="bm-card-delete-overlay">' +
+        '<div class="bm-card-delete-overlay__ring">' +
+        '<svg class="bm-card-delete-overlay__svg" viewBox="0 0 64 64" aria-hidden="true">' +
+        '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" class="bm-card-delete-overlay__track"/>' +
+        '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" class="bm-card-delete-overlay__progress" data-delete-ring="1" transform="rotate(-90 32 32)" stroke-dasharray="' +
+        DELETE_RING_C +
+        '" stroke-dashoffset="' +
+        ringOff +
+        '"/>' +
+        '</svg>' +
+        '<span class="bm-card-delete-overlay__undo" aria-hidden="true">' +
+        '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13"/></svg>' +
+        '</span></div>' +
+        '<span class="bm-card-delete-overlay__hint">Нажмите для отмены</span>' +
+        '</div></div></div>';
+      return;
+    }
+
     const tileBg = resolveTileBackground(b);
     const tc = contrastColor(tileBg);
     const bg = tileBg.startsWith('linear') ? 'background:' + tileBg : 'background-color:' + tileBg;
@@ -1764,7 +1967,6 @@ function renderGrid() {
     const imgSrc = view === 'screenshots' ? screenshotThumb(b.url) : fallbackIconUrl();
     const imgClass = view === 'screenshots' ? 'bm-card__img bm-card__img--shot' : 'bm-card__img bm-card__img--icon';
     const favLazyAttr = view !== 'screenshots' ? ' data-vb-favicon="' + escapeAttr(b.url) + '"' : '';
-    const menuOpen = openCardMenuId === b.id;
     html +=
       '<div class="bm-card-wrap' +
       (dragOverGridIndex === index && draggedGridIndex !== index ? ' is-drag-over' : '') +
@@ -1779,26 +1981,16 @@ function renderGrid() {
       '" data-bm-id="' +
       escapeAttr(b.id) +
       '">' +
-      '<button type="button" class="bm-card__menu-btn' +
-      (menuOpen ? ' is-open' : '') +
-      '" data-menu-bm="' +
+      '<div class="bm-card__actions">' +
+      '<button type="button" class="bm-card__action-btn bm-card__action-btn--edit" data-action="edit" data-id="' +
       escapeAttr(b.id) +
-      '" aria-label="Меню"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="6" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="18" r="1.5"/></svg></button>';
-    if (menuOpen) {
-      html +=
-        '<div class="bm-card__dropdown" data-stop-prop="1">' +
-        '<button type="button" data-action="edit" data-id="' +
-        escapeAttr(b.id) +
-        '">✎ Редактировать</button>' +
-        '<button type="button" data-action="open" data-url="' +
-        escapeAttr(b.url) +
-        '" data-id="' +
-        escapeAttr(b.id) +
-        '">↗ Открыть</button>' +
-        '<button type="button" class="is-danger" data-action="del" data-id="' +
-        escapeAttr(b.id) +
-        '">🗑 Удалить</button></div>';
-    }
+      '" aria-label="Редактировать">' +
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></button>' +
+      '<button type="button" class="bm-card__action-btn bm-card__action-btn--del" data-action="del" data-id="' +
+      escapeAttr(b.id) +
+      '" aria-label="Удалить">' +
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14zM10 11v6M14 11v6"/></svg></button>' +
+      '</div>';
     if ((b.clickCount || 0) > 0) html += '<div class="bm-card__clicks" style="color:' + tc + '">' + b.clickCount + '</div>';
     html += '<div class="bm-card__body" data-open-url="' + escapeAttr(b.url) + '" data-bm-id="' + escapeAttr(b.id) + '">';
     html +=
@@ -1833,6 +2025,11 @@ function renderGrid() {
 
   grid.querySelectorAll('.bm-card-wrap').forEach((wrap) => {
     const idx = +wrap.getAttribute('data-grid-index');
+    const delPending = wrap.querySelector('[data-cancel-delete="1"]');
+    if (delPending) {
+      wrap.addEventListener('dragstart', (e) => e.preventDefault());
+      return;
+    }
     wrap.addEventListener('dragstart', (e) => {
       draggedGridIndex = idx;
       e.dataTransfer.effectAllowed = 'move';
@@ -1854,12 +2051,15 @@ function renderGrid() {
     });
   });
 
-  grid.querySelectorAll('.bm-card__menu-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+  grid.querySelectorAll('[data-cancel-delete="1"]').forEach((el) => {
+    const cancel = (e) => {
+      e.preventDefault();
       e.stopPropagation();
-      const id = btn.getAttribute('data-menu-bm');
-      openCardMenuId = openCardMenuId === id ? null : id;
-      renderGrid();
+      cancelBookmarkDelete();
+    };
+    el.addEventListener('click', cancel);
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') cancel(e);
     });
   });
 
@@ -1868,42 +2068,21 @@ function renderGrid() {
       e.stopPropagation();
       const id = btn.getAttribute('data-id');
       const bm = app.bookmarks.find((x) => x.id === id);
-      openCardMenuId = null;
       if (bm) openBookmarkModal(bm);
-    });
-  });
-  grid.querySelectorAll('[data-action="open"]').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const id = btn.getAttribute('data-id');
-      const url = btn.getAttribute('data-url');
-      openCardMenuId = null;
-      const go = async () => {
-        if (app.settings.openLinksInNewTab) {
-          void incClicks(id);
-          openExternalUrl(url);
-          renderGrid();
-        } else {
-          await incClicks(id);
-          openExternalUrl(url);
-        }
-      };
-      void go();
     });
   });
   grid.querySelectorAll('[data-action="del"]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      deletingBookmarkId = btn.getAttribute('data-id');
-      openCardMenuId = null;
-      showModal('modalDelete');
+      startBookmarkDeleteCountdown(btn.getAttribute('data-id'));
     });
   });
 
   grid.querySelectorAll('.bm-card').forEach((card) => {
+    if (card.classList.contains('bm-card--delete-pending')) return;
     card.addEventListener('click', (e) => {
       const el = e.target instanceof Element ? e.target : null;
-      if (!el || el.closest('.bm-card__menu-btn') || el.closest('.bm-card__dropdown')) return;
+      if (!el || el.closest('.bm-card__action-btn')) return;
       const url = card.getAttribute('data-open-url');
       const id = card.getAttribute('data-bm-id');
       const go = async () => {
@@ -1919,6 +2098,8 @@ function renderGrid() {
       void go();
     });
   });
+
+  if (pendingDeleteBookmarkId) updateDeleteProgressRings();
 }
 
 function incClicks(id) {
@@ -1979,7 +2160,111 @@ function openBookmarkModal(bm) {
   renderColorPresets(col);
   updateBmPreview();
   syncBookmarkAutoButtonState();
+  const recentSec = $('bmRecentTabsSection');
+  if (bm) {
+    recentSec.classList.add('is-hidden');
+    recentSec.setAttribute('aria-hidden', 'true');
+  } else {
+    recentSec.classList.remove('is-hidden');
+    recentSec.setAttribute('aria-hidden', 'false');
+    loadRecentTabsForBookmarkModal();
+  }
   showModal('modalBookmark');
+}
+
+function applyRecentTabToBookmarkForm(title, url) {
+  const t = (title || '').split(' - ')[0].trim() || hostFromUrl(url);
+  $('bmTitle').value = t;
+  $('bmUrl').value = url || '';
+  bmAutoColor = true;
+  bmColorUserTouched = false;
+  $('bmAutoColor').classList.add('is-active');
+  $('bmAutoHint').classList.remove('is-hidden');
+  void (async () => {
+    try {
+      let u = normalizeUrl(String(url || '').trim());
+      const fr = await getFaviconViaBackground(u);
+      const fd = fr.ok && fr.dataUrl ? clampFaviconDataUrl(fr.dataUrl) : undefined;
+      const sampled = await extractColorFromFaviconData(u, fd);
+      $('bmColorPicker').value = sampled;
+      renderColorPresets(sampled);
+      updateBmPreview();
+    } catch (_) {}
+  })();
+  syncBookmarkAutoButtonState();
+  updateBmPreview();
+}
+
+function loadRecentTabsForBookmarkModal() {
+  const listEl = $('bmRecentTabsList');
+  listEl.innerHTML = '<span class="bm-recent-tabs__loading">Загрузка…</span>';
+  if (!isExtensionContext() || typeof chrome === 'undefined' || !chrome.tabs?.query) {
+    listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+    return;
+  }
+  try {
+    chrome.tabs.getCurrent((selfTab) => {
+      if (chrome.runtime.lastError) {
+        listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+        return;
+      }
+      const selfId = selfTab?.id;
+      chrome.tabs.query({ currentWindow: true }, (tabs) => {
+        if (chrome.runtime.lastError) {
+          listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+          return;
+        }
+        const sorted = (tabs || [])
+          .filter(
+            (t) =>
+              t.id !== selfId &&
+              t.url &&
+              !t.url.startsWith('chrome://') &&
+              !t.url.startsWith('chrome-extension://') &&
+              !t.url.startsWith('edge://') &&
+              !t.url.startsWith('about:')
+          )
+          .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
+          .slice(0, 6);
+        if (!sorted.length) {
+          listEl.innerHTML = '<span class="bm-recent-tabs__empty">Нет других вкладок в окне</span>';
+          return;
+        }
+        listEl.innerHTML = sorted
+          .map((t) => {
+            const shortTitle = escapeHtml((t.title || '').split(' - ')[0].trim() || hostFromUrl(t.url));
+            let host = '';
+            try {
+              host = new URL(t.url).hostname;
+            } catch {
+              host = '';
+            }
+            const fav = host
+              ? 'https://www.google.com/s2/favicons?domain=' + encodeURIComponent(host) + '&sz=32'
+              : '';
+            return (
+              '<button type="button" class="bm-recent-tab" data-recent-url="' +
+              escapeAttr(t.url) +
+              '" data-recent-title="' +
+              escapeAttr(t.title || '') +
+              '">' +
+              (fav ? '<img src="' + escapeAttr(fav) + '" width="16" height="16" alt="" referrerpolicy="no-referrer"/>' : '') +
+              '<span class="bm-recent-tab__title">' +
+              shortTitle +
+              '</span></button>'
+            );
+          })
+          .join('');
+        listEl.querySelectorAll('.bm-recent-tab').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            applyRecentTabToBookmarkForm(btn.getAttribute('data-recent-title'), btn.getAttribute('data-recent-url'));
+          });
+        });
+      });
+    });
+  } catch (_) {
+    listEl.innerHTML = '<span class="bm-recent-tabs__empty">Список вкладок недоступен</span>';
+  }
 }
 
 function renderColorPresets(selected) {
@@ -2486,9 +2771,8 @@ function wireSettingsBookmarks() {
   });
   document.querySelectorAll('[data-set-del]').forEach((b) => {
     b.addEventListener('click', () => {
-      deletingBookmarkId = b.getAttribute('data-set-del');
       hideModal('modalSettings');
-      showModal('modalDelete');
+      startBookmarkDeleteCountdown(b.getAttribute('data-set-del'));
     });
   });
 }
@@ -2618,6 +2902,7 @@ function renderAll() {
   renderBookmarksBar();
   renderInfoPanel();
   renderGrid();
+  renderPendingDeleteBar();
   renderCalendarWidget();
 }
 
@@ -2733,6 +3018,7 @@ async function init() {
     if (tryApplyBootCache()) {
       shownFromBoot = true;
       $('loader').classList.add('is-hidden');
+      await hydrateCalendarEventsFromCacheIfPossible();
       renderAll();
     }
   } catch (_) {}
@@ -2747,6 +3033,7 @@ async function init() {
       : Promise.resolve(),
   ]);
   await hydrateCustomBackgroundIfNeeded();
+  await hydrateCalendarEventsFromCacheIfPossible();
   if (cryptSession.hasToken && cryptSession.user) {
     if (app.user == null) {
       app.user = normalizeServerUser(cryptSession.user);
@@ -2979,18 +3266,20 @@ async function init() {
     $('bmAutoLabel').classList.remove('is-hidden');
   });
 
-  $('btnDeleteCancel').addEventListener('click', () => {
-    deletingBookmarkId = null;
-    hideModal('modalDelete');
-  });
-  $('btnDeleteConfirm').addEventListener('click', async () => {
-    if (deletingBookmarkId) {
-      app.bookmarks = app.bookmarks.filter((b) => b.id !== deletingBookmarkId);
-      deletingBookmarkId = null;
-      hideModal('modalDelete');
-      await persist(true);
-    }
-  });
+  const pendingBar = document.getElementById('pendingDeleteBar');
+  const pendingBarInner = pendingBar?.querySelector('[data-pending-delete-cancel]');
+  if (pendingBarInner) {
+    pendingBarInner.addEventListener('click', (e) => {
+      e.preventDefault();
+      cancelBookmarkDelete();
+    });
+    pendingBarInner.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        cancelBookmarkDelete();
+      }
+    });
+  }
 
   $('hiddenBgFile').addEventListener('change', async () => {
     const f = $('hiddenBgFile').files?.[0];

@@ -130,6 +130,13 @@
           <h2 id="bookmarkModalTitle" class="modal-title">Добавить закладку</h2>
           <button type="button" class="modal-close modal-close--dark" data-close="modalBookmark" aria-label="Закрыть">&times;</button>
         </div>
+        <div id="bmRecentTabsSection" class="bm-recent-tabs is-hidden" aria-hidden="true">
+          <div class="bm-recent-tabs__head">
+            <svg class="bm-recent-tabs__clock" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+            <span class="bm-recent-tabs__title">Последние вкладки</span>
+          </div>
+          <div id="bmRecentTabsList" class="bm-recent-tabs__list"></div>
+        </div>
         <form id="formBookmark" class="modal-body modal-body--dark" novalidate>
           <label class="form-field"><span class="form-label">Название</span><input type="text" id="bmTitle" class="form-input form-input--dark" autocomplete="off" placeholder="Google" /></label>
           <label class="form-field"><span class="form-label">URL</span><input type="text" id="bmUrl" class="form-input form-input--dark" autocomplete="off" placeholder="https://google.com" /></label>
@@ -155,16 +162,20 @@
       </div>
     </div>
 
-    <!-- Delete confirm -->
-    <div id="modalDelete" class="modal modal--dark is-hidden" hidden>
-      <div class="modal-backdrop" data-close="modalDelete"></div>
-      <div class="modal-dialog modal-dialog--sm modal-dialog--center">
-        <div class="delete-icon-wrap"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01"/></svg></div>
-        <h3 class="delete-title">Удалить закладку?</h3>
-        <p class="delete-msg">Это действие нельзя отменить. Закладка будет удалена навсегда.</p>
-        <div class="modal-actions modal-actions--stretch">
-          <button type="button" class="btn btn--zinc" id="btnDeleteCancel">Отмена</button>
-          <button type="button" class="btn btn--danger" id="btnDeleteConfirm">Удалить</button>
+    <div id="pendingDeleteBar" class="pending-delete-bar is-hidden" hidden aria-live="polite">
+      <div class="pending-delete-bar__inner" data-pending-delete-cancel="1" role="button" tabindex="0">
+        <div class="pending-delete-bar__ring">
+          <svg class="pending-delete-bar__svg" viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" class="pending-delete-bar__track"/>
+            <circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" data-delete-ring="1" class="pending-delete-bar__progress" transform="rotate(-90 32 32)"/>
+          </svg>
+          <span class="pending-delete-bar__undo" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13"/></svg>
+          </span>
+        </div>
+        <div class="pending-delete-bar__text">
+          <span class="pending-delete-bar__label">Удаление закладки…</span>
+          <span class="pending-delete-bar__hint">Нажмите, чтобы отменить</span>
         </div>
       </div>
     </div>
