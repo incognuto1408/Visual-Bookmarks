@@ -221,6 +221,21 @@ function logCalendarConnect(...args) {
   if (VB_CALENDAR_DEBUG) console.info('[VB Calendar]', ...args);
 }
 
+/** Спиннер + disabled на кнопках подключения календаря (модалка и настройки). */
+function setCalendarConnectButtonsLoading(loading) {
+  const nodes = [
+    document.getElementById('btnCalendarModalConnect'),
+    document.getElementById('btnCalendarSettingsConnect'),
+  ];
+  for (const b of nodes) {
+    if (!b) continue;
+    b.disabled = !!loading;
+    b.classList.toggle('vb-btn-loader', !!loading);
+    if (loading) b.setAttribute('aria-busy', 'true');
+    else b.removeAttribute('aria-busy');
+  }
+}
+
 const $ = (id) => {
   const el = document.getElementById(id);
   if (!el) throw new Error('#' + id);
@@ -441,6 +456,20 @@ function sortedBookmarks() {
   return [...app.bookmarks].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
 
+/** Локальная сетка совпадает с заводским набором (тот же набор URL) — типичный «новый ноут» до первого merge с сервером. */
+function bookmarksLookLikeDefaultOnly(bookmarks) {
+  if (!Array.isArray(bookmarks) || bookmarks.length !== DEFAULT_BOOKMARKS.length) return false;
+  const urls = (arr) =>
+    arr
+      .map((b) => normalizeUrl(b.url))
+      .filter(Boolean)
+      .slice()
+      .sort();
+  const a = urls(bookmarks);
+  const b = urls(DEFAULT_BOOKMARKS);
+  return a.length === b.length && a.every((u, i) => u === b[i]);
+}
+
 function touchUpdated() {
   app.updatedAt = Date.now();
 }
@@ -482,6 +511,9 @@ async function loadState() {
       } else {
         app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
         app.settings = { ...DEFAULT_SETTINGS };
+        app.updatedAt = 0;
+        app.user = null;
+        app.driveFileId = null;
         app.lastServerSyncAt = null;
       }
       syncMaxBookmarksToStoredCount();
@@ -816,6 +848,32 @@ async function pushServerState() {
 }
 
 /**
+ * Выход из Crypt-Chain: закладки и настройки (кроме календаря) остаются локально.
+ * Сбрасываются токен/пользователь сервера и привязка Google Календаря в расширении.
+ */
+async function performCryptChainLogout() {
+  stopServerPeriodicPull();
+  try {
+    if (typeof VisualBookmarksApi !== 'undefined') {
+      await VisualBookmarksApi.logout();
+    }
+  } catch (e) {
+    console.warn('Crypt-Chain logout:', e);
+  }
+  app.user = null;
+  app.lastServerSyncAt = null;
+  profileMenuOpen = false;
+  if (app.settings.googleCalendarEnabled) {
+    app.settings.googleCalendarEnabled = false;
+    stopCalendarRotation();
+    calendarEvents = [];
+    calendarEventIndex = 0;
+    await clearCalendarEventsCache();
+  }
+  await persist();
+}
+
+/**
  * После входа или регистрации Crypt-Chain.
  * Вход: подтягиваем сервер и сливаем с локальным по `updatedAt` (как ручная синхронизация).
  * Регистрация: на пустом сервере (204) оставляем локальные закладки/настройки и отправляем их на сервер.
@@ -900,7 +958,12 @@ async function pullServerMerge(opts = {}) {
       ru = app.updatedAt;
     }
 
-    if (app.updatedAt > ru) {
+    const takeServerDespiteLocalNewer =
+      Array.isArray(remote.bookmarks) &&
+      remote.bookmarks.length > 0 &&
+      bookmarksLookLikeDefaultOnly(app.bookmarks);
+
+    if (!takeServerDespiteLocalNewer && app.updatedAt > ru) {
       await pushServerState();
     } else {
       const inSync = ruNorm > 0 && ruNorm === app.updatedAt;
@@ -913,7 +976,7 @@ async function pullServerMerge(opts = {}) {
             typeof remote.settings === 'object' &&
             Object.keys(remote.settings).length > 0));
 
-      if (!inSync && (serverNewer || initialFromServer)) {
+      if (takeServerDespiteLocalNewer || (!inSync && (serverNewer || initialFromServer))) {
         if (Array.isArray(remote.bookmarks)) {
           const mapped = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
           app.bookmarks =
@@ -927,6 +990,8 @@ async function pullServerMerge(opts = {}) {
         }
         if (ruNorm > 0) {
           app.updatedAt = ruNorm;
+        } else if (takeServerDespiteLocalNewer) {
+          touchUpdated();
         }
         syncMaxBookmarksToStoredCount();
         if (await enrichFaviconBackgrounds()) touchUpdated();
@@ -1317,14 +1382,7 @@ async function connectGoogleCalendar() {
     return;
   }
   calendarConnectInFlight = true;
-  const calModalBtn = document.getElementById('btnCalendarModalConnect');
-  const calSettingsBtn = document.getElementById('btnCalendarSettingsConnect');
-  [calModalBtn, calSettingsBtn].forEach((b) => {
-    if (b) {
-      b.disabled = true;
-      b.setAttribute('aria-busy', 'true');
-    }
-  });
+  setCalendarConnectButtonsLoading(true);
 
   const finishOk = async (events) => {
     app.settings.googleCalendarEnabled = true;
@@ -1370,13 +1428,8 @@ async function connectGoogleCalendar() {
     alert((e && e.message) || String(e));
   } finally {
     calendarConnectInFlight = false;
-    logCalendarConnect('finally: сняты disabled / aria-busy с кнопок');
-    [calModalBtn, calSettingsBtn].forEach((b) => {
-      if (b) {
-        b.disabled = false;
-        b.removeAttribute('aria-busy');
-      }
-    });
+    logCalendarConnect('finally: сняты loader / disabled с кнопок');
+    setCalendarConnectButtonsLoading(false);
   }
 }
 
@@ -2486,14 +2539,15 @@ function wireSettingsSystem() {
   });
 
   $('btnServerLogout').addEventListener('click', async () => {
-    stopServerPeriodicPull();
-    if (typeof VisualBookmarksApi !== 'undefined') await VisualBookmarksApi.logout();
-    app.user = null;
-    app.lastServerSyncAt = null;
-    await saveLocal();
-    st.textContent = 'Сессия сброшена';
-    renderAll();
-    renderHeader();
+    const stEl = $('serverApiStatus');
+    stEl.textContent = 'Выход…';
+    try {
+      await performCryptChainLogout();
+      stEl.textContent = 'Вы вышли из аккаунта. Закладки и настройки сохранены, календарь отключён.';
+    } catch (e) {
+      console.warn('Выход из аккаунта:', e);
+      stEl.textContent = e.message || String(e);
+    }
   });
 
   $('backupSave').addEventListener('click', () => {
@@ -2581,6 +2635,7 @@ function showModal(id) {
     if (b) {
       b.disabled = false;
       b.removeAttribute('aria-busy');
+      b.classList.remove('vb-btn-loader');
     }
     logCalendarConnect('модалка календаря открыта: сброшены inFlight и кнопка (на случай зависшего прошлого запуска)');
   }
@@ -2606,158 +2661,35 @@ function renderAll() {
   renderCalendarWidget();
 }
 
-/* --- Browser chrome modals --- */
-async function openBrowserModal(kind) {
-  const title = $('browserModalTitle');
-  const body = $('browserModalBody');
-  body.innerHTML = '<div style="padding:1rem;color:#a1a1aa">Загрузка…</div>';
-  showModal('modalBrowser');
+/** Встроенные страницы браузера в новой вкладке (без модалки и без API bookmarks/history/…). */
+function browserToolkitUrl(kind) {
+  const edge = typeof navigator !== 'undefined' && /Edg\//.test(navigator.userAgent || '');
+  const map = edge
+    ? {
+        sessions: 'edge://history/',
+        downloads: 'edge://downloads/',
+        bookmarks: 'edge://favorites/',
+        history: 'edge://history/',
+      }
+    : {
+        sessions: 'chrome://history/',
+        downloads: 'chrome://downloads/',
+        bookmarks: 'chrome://bookmarks/',
+        history: 'chrome://history/',
+      };
+  return map[kind] || '';
+}
 
-  if (!isExtensionContext()) {
-    body.innerHTML =
-      '<div class="browser-item">Эти списки работают только когда новая вкладка открыта как страница расширения. Загрузите папку через chrome://extensions → «Загрузить распакованное».</div>';
+function openBrowserToolkitPage(kind) {
+  const url = browserToolkitUrl(kind);
+  if (!url) return;
+  if (!isExtensionContext() || typeof chrome.tabs?.create !== 'function') {
+    alert('Доступно только в расширении Chrome (chrome://extensions → загрузить распакованное).');
     return;
   }
-
-  try {
-    const linkRel = app.settings.openLinksInNewTab ? ' target="_blank" rel="noopener noreferrer"' : ' rel="noopener noreferrer"';
-    if (kind === 'sessions') {
-      title.textContent = 'Закрытые вкладки';
-      if (!chrome.sessions || !chrome.sessions.getRecentlyClosed) {
-        body.innerHTML = '<div class="browser-item">API sessions недоступен</div>';
-        return;
-      }
-      const sessions = await chrome.sessions.getRecentlyClosed({ maxResults: 25 });
-      if (!sessions.length) body.innerHTML = '<div class="browser-item">Нет недавно закрытых</div>';
-      else {
-        body.innerHTML = sessions
-          .map((s) => {
-            if (s.tab) {
-              return (
-                '<button type="button" class="browser-item" data-restore-session="' +
-                escapeAttr(s.tab.sessionId) +
-                '"><span>' +
-                escapeHtml(s.tab.title || s.tab.url || 'Вкладка') +
-                '</span><span class="browser-item__sub">' +
-                escapeHtml(s.tab.url || '') +
-                '</span></button>'
-              );
-            }
-            if (s.window && s.window.tabs?.length) {
-              return (
-                '<button type="button" class="browser-item" data-restore-window="' +
-                escapeAttr(s.window.sessionId) +
-                '"><span>Окно (' +
-                s.window.tabs.length +
-                ' вкладок)</span></button>'
-              );
-            }
-            return '';
-          })
-          .join('');
-      }
-    } else if (kind === 'downloads') {
-      title.textContent = 'Загрузки';
-      if (!chrome.downloads || !chrome.downloads.search) {
-        body.innerHTML = '<div class="browser-item">API downloads недоступен</div>';
-        return;
-      }
-      const items = await chrome.downloads.search({ limit: 30, orderBy: ['-startTime'] });
-      if (!items.length) body.innerHTML = '<div class="browser-item">Нет загрузок</div>';
-      else {
-        body.innerHTML = items
-          .map(
-            (d) =>
-              '<button type="button" class="browser-item" data-open-download="' +
-              escapeAttr(d.id) +
-              '"><span>' +
-              escapeHtml(d.filename?.split(/[/\\]/).pop() || d.url || 'Файл') +
-              '</span><span class="browser-item__sub">' +
-              escapeHtml(d.state || '') +
-              '</span></button>'
-          )
-          .join('');
-      }
-    } else if (kind === 'bookmarks') {
-      title.textContent = 'Закладки браузера';
-      if (!chrome.bookmarks || !chrome.bookmarks.getTree) {
-        body.innerHTML = '<div class="browser-item">API bookmarks недоступен</div>';
-        return;
-      }
-      const tree = await chrome.bookmarks.getTree();
-      const links = [];
-      function walk(nodes) {
-        nodes.forEach((n) => {
-          if (n.url) links.push({ title: n.title, url: n.url });
-          if (n.children) walk(n.children);
-        });
-      }
-      walk(tree);
-      const slice = links.slice(0, 80);
-      if (!slice.length) body.innerHTML = '<div class="browser-item">Пусто</div>';
-      else
-        body.innerHTML = slice
-          .map(
-            (l) =>
-              '<a class="browser-item" href="' +
-              escapeAttr(l.url) +
-              '"' +
-              linkRel +
-              '><span>' +
-              escapeHtml(l.title || l.url) +
-              '</span><span class="browser-item__sub">' +
-              escapeHtml(l.url) +
-              '</span></a>'
-          )
-          .join('');
-    } else if (kind === 'history') {
-      title.textContent = 'История';
-      if (!chrome.history || !chrome.history.search) {
-        body.innerHTML = '<div class="browser-item">API history недоступен</div>';
-        return;
-      }
-      const h = await chrome.history.search({ text: '', maxResults: 50 });
-      if (!h.length) body.innerHTML = '<div class="browser-item">Пусто</div>';
-      else
-        body.innerHTML = h
-          .map(
-            (x) =>
-              '<a class="browser-item" href="' +
-              escapeAttr(x.url) +
-              '"' +
-              linkRel +
-              '><span>' +
-              escapeHtml(x.title || x.url) +
-              '</span><span class="browser-item__sub">' +
-              escapeHtml(x.url || '') +
-              '</span></a>'
-          )
-          .join('');
-    }
-  } catch (e) {
-    body.innerHTML = '<div class="browser-item">' + escapeHtml(e.message || String(e)) + '</div>';
-  }
-
-  body.querySelectorAll('[data-restore-session]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const sid = btn.getAttribute('data-restore-session');
-      if (chrome?.sessions?.restore) chrome.sessions.restore(sid);
-      hideModal('modalBrowser');
-    });
-  });
-  body.querySelectorAll('[data-restore-window]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const sid = btn.getAttribute('data-restore-window');
-      if (chrome?.sessions?.restore) chrome.sessions.restore(sid);
-      hideModal('modalBrowser');
-    });
-  });
-  body.querySelectorAll('[data-open-download]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const id = +btn.getAttribute('data-open-download');
-      if (chrome?.downloads?.open) chrome.downloads.open(id);
-      hideModal('modalBrowser');
-    });
+  chrome.tabs.create({ url }, () => {
+    const err = chrome.runtime.lastError;
+    if (err) console.warn('tabs.create:', err.message);
   });
 }
 
@@ -2881,12 +2813,11 @@ async function init() {
   });
 
   $('btnLogout').addEventListener('click', async () => {
-    if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
-      await VisualBookmarksApi.logout();
+    try {
+      await performCryptChainLogout();
+    } catch (e) {
+      console.warn('Выход из аккаунта:', e);
     }
-    app.user = null;
-    profileMenuOpen = false;
-    persist();
   });
 
   $('btnEngine').addEventListener('click', (e) => {
@@ -2904,7 +2835,7 @@ async function init() {
   });
 
   document.querySelectorAll('[data-browser-action]').forEach((b) => {
-    b.addEventListener('click', () => openBrowserModal(b.getAttribute('data-browser-action')));
+    b.addEventListener('click', () => openBrowserToolkitPage(b.getAttribute('data-browser-action')));
   });
 
   $('btnBottomExport').addEventListener('click', () => {
