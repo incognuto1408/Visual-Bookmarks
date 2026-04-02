@@ -354,10 +354,9 @@ async function syncI18n() {
 }
 
 let editingBookmarkId = null;
-let pendingDeleteBookmarkId = null;
-let pendingDeleteProgress = 0;
-let pendingDeleteIntervalId = null;
-let pendingDeleteStartMs = 0;
+/** id закладки → момент старта отсчёта удаления (несколько вкладок могут удаляться параллельно) */
+const pendingBookmarkDeletes = new Map();
+let pendingDeletesTickIntervalId = null;
 const BOOKMARK_DELETE_COUNTDOWN_MS = 3000;
 let authMode = 'login';
 let settingsTab = 'appearance';
@@ -381,6 +380,8 @@ const BM_DESC_AUTOFILL_DEBOUNCE_MS = 550;
 /** События primary-календаря на сегодня (Google Calendar API) */
 let calendarEvents = [];
 let calendarEventIndex = 0;
+let calendarPopoverOpen = false;
+let calendarSelectedEventId = null;
 let calendarRotateTimer = null;
 /** Повторный клик «Подключить календарь», пока ждём service worker / OAuth */
 let calendarConnectInFlight = false;
@@ -1241,6 +1242,8 @@ async function performCryptChainLogout() {
       stopCalendarRotation();
       calendarEvents = [];
       calendarEventIndex = 0;
+      calendarPopoverOpen = false;
+      calendarSelectedEventId = null;
       await clearCalendarEventsCache();
       await revokeGoogleCalendarCachedAuth();
       touchUpdated();
@@ -1569,7 +1572,7 @@ function stopCalendarRotation() {
 
 function startCalendarRotation() {
   stopCalendarRotation();
-  if (!app.settings.googleCalendarEnabled || calendarEvents.length <= 1) return;
+  if (!app.settings.googleCalendarEnabled || calendarEvents.length <= 1 || calendarPopoverOpen) return;
   calendarRotateTimer = setInterval(() => {
     calendarEventIndex = (calendarEventIndex + 1) % calendarEvents.length;
     renderCalendarWidget();
@@ -1643,6 +1646,8 @@ function applyCalendarResult(events) {
   stopCalendarRotation();
   calendarEvents = Array.isArray(events) ? events : [];
   calendarEventIndex = 0;
+  calendarPopoverOpen = false;
+  calendarSelectedEventId = null;
   scheduleCalendarWidgetPaint();
 }
 
@@ -1922,6 +1927,7 @@ async function connectGoogleCalendar() {
     }
 
     logCalendarConnect('fallback: подключение на странице (нет sendMessage)');
+    await revokeGoogleCalendarCachedAuth();
     const token = await VisualBookmarksCalendar.getAuthToken(true);
     if (!token) throw new Error(tr('alert.calToken'));
     const events = await VisualBookmarksCalendar.fetchTodayEvents(token);
@@ -1936,9 +1942,20 @@ async function connectGoogleCalendar() {
   }
 }
 
+function calendarFormatEventRange(ev) {
+  if (!ev) return '';
+  if (ev.isAllDay || ev.startTime === 'Весь день' || ev.time === 'Весь день')
+    return ev.startTime || ev.time || '';
+  const st = ev.startTime || '';
+  const et = ev.endTime || '';
+  if (st && et) return st + ' — ' + et;
+  return ev.time || st;
+}
+
 function renderCalendarWidget() {
   const root = $('calendarWidgetRoot');
   if (!root) return;
+  root.classList.toggle('calendar-widget-root--expanded', !!calendarPopoverOpen);
   if (app.settings.showCalendar === false) {
     root.classList.add('is-hidden');
     stopCalendarRotation();
@@ -1978,12 +1995,83 @@ function renderCalendarWidget() {
     return;
   }
 
+  if (calendarPopoverOpen) {
+    const selected =
+      calendarSelectedEventId &&
+      calendarEvents.find((e) => e.id === calendarSelectedEventId);
+    const detail = selected || null;
+    let detailHtml = '';
+    if (detail) {
+      const desc = (detail.description || '').trim();
+      const descBlock = desc
+        ? '<p class="calendar-popover__detail-desc">' +
+          escapeHtml(desc).replace(/\n/g, '<br>') +
+          '</p>'
+        : '';
+      detailHtml =
+        '<div class="calendar-popover__detail">' +
+        '<p class="calendar-popover__detail-time">' +
+        escapeHtml(calendarFormatEventRange(detail)) +
+        '</p>' +
+        '<p class="calendar-popover__detail-title">' +
+        escapeHtml(detail.title) +
+        '</p>' +
+        descBlock +
+        '</div>';
+    }
+    const rows = calendarEvents
+      .map((e) => calendarPopoverRowHtml(e, detail && detail.id === e.id))
+      .join('');
+    root.innerHTML =
+      '<div class="calendar-popover" role="dialog" aria-label="' +
+      escapeAttr(tr('cal.popoverTitle')) +
+      '">' +
+      '<div class="calendar-popover__header">' +
+      '<span class="calendar-popover__heading">' +
+      escapeHtml(tr('cal.popoverTitle')) +
+      '</span>' +
+      '<button type="button" class="calendar-popover__close" id="calendarWidgetPopoverClose" title="' +
+      escapeAttr(tr('cal.closeAria')) +
+      '" aria-label="' +
+      escapeAttr(tr('cal.closeAria')) +
+      '">' +
+      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>' +
+      '</button></div>' +
+      detailHtml +
+      '<div class="calendar-popover__list">' +
+      rows +
+      '</div></div>';
+
+    const closeBtn = document.getElementById('calendarWidgetPopoverClose');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        calendarPopoverOpen = false;
+        calendarSelectedEventId = null;
+        renderCalendarWidget();
+        startCalendarRotation();
+      });
+    }
+    root.querySelectorAll('[data-cal-row-id]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const id = el.getAttribute('data-cal-row-id');
+        calendarSelectedEventId = calendarSelectedEventId === id ? null : id;
+        renderCalendarWidget();
+      });
+    });
+    return;
+  }
+
   const ev = calendarEvents[calendarEventIndex % calendarEvents.length];
   const many = calendarEvents.length > 1;
   root.innerHTML =
-    '<div class="calendar-panel">' +
+    '<div class="calendar-panel calendar-panel--compact">' +
+    '<button type="button" class="calendar-panel__open" id="calendarWidgetOpen" title="' +
+    escapeAttr(tr('cal.openEventsAria')) +
+    '" aria-label="' +
+    escapeAttr(tr('cal.openEventsAria')) +
+    '">' +
     '<div class="calendar-panel__bar" style="background-color:' +
-    escapeAttr(ev.color) +
+    escapeAttrEvColor(ev.color) +
     '"></div>' +
     '<div class="calendar-panel__body">' +
     '<span class="calendar-panel__title">' +
@@ -1994,7 +2082,7 @@ function renderCalendarWidget() {
     (many
       ? ' <span>• ' + (calendarEventIndex + 1) + '/' + calendarEvents.length + '</span>'
       : '') +
-    '</div></div>' +
+    '</div></div></button>' +
     (many
       ? '<button type="button" class="calendar-panel__next" id="calendarWidgetNext" title="' +
         escapeAttr(tr('cal.nextTitle')) +
@@ -2004,13 +2092,53 @@ function renderCalendarWidget() {
       : '') +
     '</div>';
 
+  const openBtn = document.getElementById('calendarWidgetOpen');
+  if (openBtn) {
+    openBtn.addEventListener('click', () => {
+      calendarPopoverOpen = true;
+      const cur = calendarEvents[calendarEventIndex % calendarEvents.length];
+      calendarSelectedEventId = cur ? cur.id : null;
+      stopCalendarRotation();
+      renderCalendarWidget();
+    });
+  }
   const next = many ? document.getElementById('calendarWidgetNext') : null;
   if (next) {
-    next.addEventListener('click', () => {
+    next.addEventListener('click', (e) => {
+      e.stopPropagation();
       calendarEventIndex = (calendarEventIndex + 1) % calendarEvents.length;
       renderCalendarWidget();
     });
   }
+}
+
+function escapeAttrEvColor(color) {
+  const c = color && String(color).trim();
+  if (c && (/^#[0-9a-fA-F]{3}$/.test(c) || /^#[0-9a-fA-F]{6}$/.test(c))) return escapeAttr(c);
+  return escapeAttr('#4285f4');
+}
+
+function calendarPopoverRowHtml(ev, isSelected) {
+  const cls = 'calendar-popover__row' + (isSelected ? ' is-selected' : '');
+  return (
+    '<button type="button" class="' +
+    cls +
+    '" data-cal-row-id="' +
+    escapeAttr(ev.id) +
+    '">' +
+    '<span class="calendar-popover__row-bar" style="background-color:' +
+    escapeAttrEvColor(ev.color) +
+    '"></span>' +
+    '<span class="calendar-popover__row-body">' +
+    '<span class="calendar-popover__row-title">' +
+    escapeHtml(ev.title) +
+    '</span>' +
+    '<span class="calendar-popover__row-meta">' +
+    escapeHtml(ev.time) +
+    '</span></span>' +
+    '<svg class="calendar-popover__row-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>' +
+    '</button>'
+  );
 }
 
 function computePageBgSignature(bg) {
@@ -2324,69 +2452,74 @@ function renderInfoPanel() {
 const DELETE_RING_R = 28;
 const DELETE_RING_C = 2 * Math.PI * DELETE_RING_R;
 
-function clearPendingDeleteInterval() {
-  if (pendingDeleteIntervalId != null) {
-    clearInterval(pendingDeleteIntervalId);
-    pendingDeleteIntervalId = null;
+function clearPendingDeletesTick() {
+  if (pendingDeletesTickIntervalId != null) {
+    clearInterval(pendingDeletesTickIntervalId);
+    pendingDeletesTickIntervalId = null;
   }
 }
 
+function bookmarkDeleteProgressForStartMs(startMs) {
+  const elapsed = Date.now() - startMs;
+  return Math.min((elapsed / BOOKMARK_DELETE_COUNTDOWN_MS) * 100, 100);
+}
+
 function updateDeleteProgressRings() {
-  const off = DELETE_RING_C * (1 - pendingDeleteProgress / 100);
-  document.querySelectorAll('[data-delete-ring="1"]').forEach((el) => {
+  document.querySelectorAll('[data-delete-ring="1"][data-bm-pending-id]').forEach((el) => {
+    const id = el.getAttribute('data-bm-pending-id');
+    const startMs = id != null ? pendingBookmarkDeletes.get(id) : undefined;
+    if (startMs == null) return;
+    const pct = bookmarkDeleteProgressForStartMs(startMs);
+    const off = DELETE_RING_C * (1 - pct / 100);
     el.setAttribute('stroke-dasharray', String(DELETE_RING_C));
     el.setAttribute('stroke-dashoffset', String(off));
   });
 }
 
-function cancelBookmarkDelete() {
-  clearPendingDeleteInterval();
-  pendingDeleteBookmarkId = null;
-  pendingDeleteProgress = 0;
-  const bar = document.getElementById('pendingDeleteBar');
-  if (bar) {
-    bar.classList.add('is-hidden');
-    bar.hidden = true;
+function pendingDeletesTick() {
+  const now = Date.now();
+  const toFinish = [];
+  for (const [bmId, startMs] of pendingBookmarkDeletes) {
+    if (now - startMs >= BOOKMARK_DELETE_COUNTDOWN_MS) toFinish.push(bmId);
   }
-  renderGrid();
+  if (toFinish.length > 0) {
+    const finishSet = new Set(toFinish);
+    for (const bmId of toFinish) pendingBookmarkDeletes.delete(bmId);
+    app.bookmarks = app.bookmarks.filter((b) => !finishSet.has(b.id)).map((b, i) => ({ ...b, order: i }));
+    void persist(true);
+    renderPendingDeleteBar();
+    renderGrid();
+  } else {
+    updateDeleteProgressRings();
+  }
+  if (pendingBookmarkDeletes.size === 0) clearPendingDeletesTick();
 }
 
-function finishPendingBookmarkDelete() {
-  const id = pendingDeleteBookmarkId;
-  clearPendingDeleteInterval();
-  pendingDeleteBookmarkId = null;
-  pendingDeleteProgress = 0;
-  const bar = document.getElementById('pendingDeleteBar');
-  if (bar) {
-    bar.classList.add('is-hidden');
-    bar.hidden = true;
-  }
-  if (!id) {
-    renderGrid();
+function ensurePendingDeletesTick() {
+  if (pendingBookmarkDeletes.size === 0) {
+    clearPendingDeletesTick();
     return;
   }
-  app.bookmarks = app.bookmarks.filter((b) => b.id !== id).map((b, i) => ({ ...b, order: i }));
-  void persist(true);
+  if (pendingDeletesTickIntervalId != null) return;
+  pendingDeletesTickIntervalId = setInterval(pendingDeletesTick, 50);
+  pendingDeletesTick();
+}
+
+/** Отмена отложенного удаления одной закладки (у каждой свой таймер). */
+function cancelBookmarkDelete(specificBookmarkId) {
+  if (specificBookmarkId == null || specificBookmarkId === '') return;
+  pendingBookmarkDeletes.delete(specificBookmarkId);
+  if (pendingBookmarkDeletes.size === 0) clearPendingDeletesTick();
+  renderPendingDeleteBar();
+  renderGrid();
 }
 
 function startBookmarkDeleteCountdown(id) {
-  clearPendingDeleteInterval();
-  pendingDeleteBookmarkId = id;
-  pendingDeleteProgress = 0;
-  pendingDeleteStartMs = Date.now();
+  pendingBookmarkDeletes.set(id, Date.now());
   renderGrid();
   renderPendingDeleteBar();
   updateDeleteProgressRings();
-  pendingDeleteIntervalId = setInterval(() => {
-    if (pendingDeleteBookmarkId !== id) {
-      clearPendingDeleteInterval();
-      return;
-    }
-    const elapsed = Date.now() - pendingDeleteStartMs;
-    pendingDeleteProgress = Math.min((elapsed / BOOKMARK_DELETE_COUNTDOWN_MS) * 100, 100);
-    updateDeleteProgressRings();
-    if (elapsed >= BOOKMARK_DELETE_COUNTDOWN_MS) finishPendingBookmarkDelete();
-  }, 50);
+  ensurePendingDeletesTick();
 }
 
 function isBookmarkVisibleInGrid(id) {
@@ -2398,18 +2531,56 @@ function isBookmarkVisibleInGrid(id) {
 function renderPendingDeleteBar() {
   const bar = document.getElementById('pendingDeleteBar');
   if (!bar) return;
-  if (!pendingDeleteBookmarkId) {
+  const hiddenPending = [...pendingBookmarkDeletes.keys()].filter((bmId) => !isBookmarkVisibleInGrid(bmId));
+  if (hiddenPending.length === 0) {
     bar.classList.add('is-hidden');
     bar.hidden = true;
-    return;
-  }
-  if (isBookmarkVisibleInGrid(pendingDeleteBookmarkId)) {
-    bar.classList.add('is-hidden');
-    bar.hidden = true;
+    bar.innerHTML = '';
     return;
   }
   bar.classList.remove('is-hidden');
   bar.hidden = false;
+  bar.innerHTML = hiddenPending
+    .map((bmId) => {
+      const bm = app.bookmarks.find((b) => b.id === bmId);
+      const title = (bm && bm.title) || '…';
+      const startMs = pendingBookmarkDeletes.get(bmId) || Date.now();
+      const pct = bookmarkDeleteProgressForStartMs(startMs);
+      const ringOff = DELETE_RING_C * (1 - pct / 100);
+      return (
+        '<div class="pending-delete-bar__inner" data-pending-delete-cancel="1" data-bm-pending-id="' +
+        escapeAttr(bmId) +
+        '" role="button" tabindex="0" aria-label="' +
+        escapeAttr(tr('aria.cancelDelete')) +
+        '">' +
+        '<div class="pending-delete-bar__ring">' +
+        '<svg class="pending-delete-bar__svg" viewBox="0 0 64 64" aria-hidden="true">' +
+        '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" class="pending-delete-bar__track"/>' +
+        '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" class="pending-delete-bar__progress" data-delete-ring="1" data-bm-pending-id="' +
+        escapeAttr(bmId) +
+        '" transform="rotate(-90 32 32)" stroke-dasharray="' +
+        DELETE_RING_C +
+        '" stroke-dashoffset="' +
+        ringOff +
+        '"/>' +
+        '</svg>' +
+        '<span class="pending-delete-bar__undo" aria-hidden="true">' +
+        '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 00-9-9 9 9 0 00-6 2.3L3 13"/></svg>' +
+        '</span></div>' +
+        '<div class="pending-delete-bar__text">' +
+        '<span class="pending-delete-bar__label" data-i18n="del.barLabel">' +
+        escapeHtml(tr('del.barLabel')) +
+        '</span>' +
+        '<span class="pending-delete-bar__hint" data-i18n="del.barHint">' +
+        escapeHtml(tr('del.barHint')) +
+        '</span>' +
+        '<span class="pending-delete-bar__title">' +
+        escapeHtml(title) +
+        '</span></div></div>'
+      );
+    })
+    .join('');
+  if (typeof VisualBookmarksI18n !== 'undefined') VisualBookmarksI18n.applyDom(bar);
   updateDeleteProgressRings();
 }
 
@@ -2424,24 +2595,29 @@ function renderGrid() {
   const atMax = app.bookmarks.length >= maxBm;
   let html = '';
 
-  const ringOff = DELETE_RING_C * (1 - pendingDeleteProgress / 100);
-
   list.forEach((b, index) => {
-    if (pendingDeleteBookmarkId === b.id) {
+    const delStart = pendingBookmarkDeletes.get(b.id);
+    if (delStart != null) {
+      const pct = bookmarkDeleteProgressForStartMs(delStart);
+      const ringOff = DELETE_RING_C * (1 - pct / 100);
       html +=
         '<div class="bm-card-wrap' +
         (dragOverGridIndex === index && draggedGridIndex !== index ? ' is-drag-over' : '') +
         '" data-grid-index="' +
         index +
         '" draggable="false">' +
-        '<div class="bm-card bm-card--delete-pending" tabindex="0" data-cancel-delete="1" role="button" aria-label="' +
+        '<div class="bm-card bm-card--delete-pending" tabindex="0" data-cancel-delete="1" data-bm-pending-id="' +
+        escapeAttr(b.id) +
+        '" role="button" aria-label="' +
         escapeAttr(tr('aria.cancelDelete')) +
         '">' +
         '<div class="bm-card-delete-overlay">' +
         '<div class="bm-card-delete-overlay__ring">' +
         '<svg class="bm-card-delete-overlay__svg" viewBox="0 0 64 64" aria-hidden="true">' +
         '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" class="bm-card-delete-overlay__track"/>' +
-        '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" class="bm-card-delete-overlay__progress" data-delete-ring="1" transform="rotate(-90 32 32)" stroke-dasharray="' +
+        '<circle cx="32" cy="32" r="28" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" class="bm-card-delete-overlay__progress" data-delete-ring="1" data-bm-pending-id="' +
+        escapeAttr(b.id) +
+        '" transform="rotate(-90 32 32)" stroke-dasharray="' +
         DELETE_RING_C +
         '" stroke-dashoffset="' +
         ringOff +
@@ -2555,10 +2731,11 @@ function renderGrid() {
   });
 
   grid.querySelectorAll('[data-cancel-delete="1"]').forEach((el) => {
+    const bmId = el.getAttribute('data-bm-pending-id');
     const cancel = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      cancelBookmarkDelete();
+      if (bmId) cancelBookmarkDelete(bmId);
     };
     el.addEventListener('click', cancel);
     el.addEventListener('keydown', (e) => {
@@ -2602,7 +2779,7 @@ function renderGrid() {
     });
   });
 
-  if (pendingDeleteBookmarkId) updateDeleteProgressRings();
+  if (pendingBookmarkDeletes.size > 0) updateDeleteProgressRings();
 }
 
 function incClicks(id) {
@@ -3336,6 +3513,8 @@ function wireSettingsAppearance(totalPages) {
       app.settings.googleCalendarEnabled = false;
       stopCalendarRotation();
       calendarEvents = [];
+      calendarPopoverOpen = false;
+      calendarSelectedEventId = null;
       void (async () => {
         await clearCalendarEventsCache();
         await revokeGoogleCalendarCachedAuth();
@@ -3569,6 +3748,12 @@ function onGlobalClick(e) {
   if (!t.closest('#headerProfile')) {
     profileMenuOpen = false;
     $('profileDropdown')?.classList.add('is-hidden');
+  }
+  if (calendarPopoverOpen && !t.closest('.calendar-widget-root')) {
+    calendarPopoverOpen = false;
+    calendarSelectedEventId = null;
+    renderCalendarWidget();
+    startCalendarRotation();
   }
   renderSearch();
   renderHeader();
@@ -3927,17 +4112,21 @@ async function init() {
   });
 
   const pendingBar = document.getElementById('pendingDeleteBar');
-  const pendingBarInner = pendingBar?.querySelector('[data-pending-delete-cancel]');
-  if (pendingBarInner) {
-    pendingBarInner.addEventListener('click', (e) => {
+  if (pendingBar) {
+    pendingBar.addEventListener('click', (e) => {
+      const inner = e.target instanceof Element ? e.target.closest('[data-pending-delete-cancel]') : null;
+      if (!inner) return;
       e.preventDefault();
-      cancelBookmarkDelete();
+      const pid = inner.getAttribute('data-bm-pending-id');
+      if (pid) cancelBookmarkDelete(pid);
     });
-    pendingBarInner.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        cancelBookmarkDelete();
-      }
+    pendingBar.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const inner = e.target instanceof Element ? e.target.closest('[data-pending-delete-cancel]') : null;
+      if (!inner) return;
+      e.preventDefault();
+      const pid = inner.getAttribute('data-bm-pending-id');
+      if (pid) cancelBookmarkDelete(pid);
     });
   }
 

@@ -16,6 +16,9 @@
     o['cal.noEvents'] = o.cal.noEvents;
     o['cal.nextTitle'] = o.cal.nextTitle;
     o['cal.nextAria'] = o.cal.nextAria;
+    o['cal.popoverTitle'] = o.cal.popoverTitle;
+    o['cal.closeAria'] = o.cal.closeAria;
+    o['cal.openEventsAria'] = o.cal.openEventsAria;
     delete o.cal;
   }
 

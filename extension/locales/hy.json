@@ -149,5 +149,8 @@
   "cal.extensionOnly": "Օրացույցը հասանելի է միայն Chrome ընդլայնման մեջ",
   "cal.noEvents": "Այսօր իրադարձություններ չկան",
   "cal.nextTitle": "Հաջորդ իրադարձությունը",
-  "cal.nextAria": "Հաջորդ"
+  "cal.nextAria": "Հաջորդ",
+  "cal.popoverTitle": "Այսօրվա իրադարձությունները",
+  "cal.closeAria": "Փակել ցանկը",
+  "cal.openEventsAria": "Բացել այսօրվա բոլոր իրադարձությունները"
 }

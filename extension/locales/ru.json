@@ -149,5 +149,8 @@
   "cal.extensionOnly": "Календарь доступен только в расширении Chrome",
   "cal.noEvents": "Нет событий на сегодня",
   "cal.nextTitle": "Следующее событие",
-  "cal.nextAria": "Следующее"
+  "cal.nextAria": "Следующее",
+  "cal.popoverTitle": "События на сегодня",
+  "cal.closeAria": "Закрыть список",
+  "cal.openEventsAria": "Открыть все события на сегодня"
 }

@@ -59,6 +59,17 @@
     }
   }
 
+  function calendarDescriptionPlain(raw) {
+    if (!raw || typeof raw !== 'string') return '';
+    return raw
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 2000);
+  }
+
   function parseEvent(ev, calendarId, calendarColor) {
     if (!ev || ev.status === 'cancelled') return null;
     const title = (ev.summary && String(ev.summary).trim()) || '(Без названия)';
@@ -68,7 +79,34 @@
     if (!startRaw) return null;
     const d = new Date(startRaw);
     if (Number.isNaN(d.getTime())) return null;
-    const time = isAllDay ? 'Весь день' : formatTime(d);
+
+    let endD = null;
+    if (!isAllDay) {
+      const endRaw = ev.end?.dateTime || ev.end?.date;
+      if (endRaw) {
+        endD = new Date(endRaw);
+        if (Number.isNaN(endD.getTime())) endD = null;
+      }
+    }
+
+    let startTime;
+    let endTime = '';
+    let time;
+    if (isAllDay) {
+      startTime = 'Весь день';
+      time = 'Весь день';
+    } else {
+      startTime = formatTime(d);
+      if (endD) {
+        endTime = formatTime(endD);
+        time = endTime && endTime !== startTime ? startTime + ' — ' + endTime : startTime;
+      } else {
+        time = startTime;
+      }
+    }
+
+    const description = calendarDescriptionPlain(ev.description || '');
+
     let color = colorFromEvent(ev);
     if (color === '#4285f4' && calendarColor && /^#[0-9a-fA-F]{6}$/.test(String(calendarColor).trim())) {
       color = String(calendarColor).trim();
@@ -77,6 +115,10 @@
       id: encodeURIComponent(calendarId) + ':' + (ev.id || String(d.getTime()) + title),
       title,
       time,
+      startTime,
+      endTime,
+      description,
+      isAllDay: !!isAllDay,
       timeSort: d.getTime(),
       color,
     };
@@ -313,7 +355,17 @@ async function connectCalendarInWorker() {
     );
   };
   try {
-    console.info('[VB Calendar SW]', 'getAuthToken(interactive: true) — может открыться окно Google…');
+    await new Promise((resolve) => {
+      if (typeof chrome !== 'undefined' && chrome.identity && typeof chrome.identity.clearAllCachedAuthTokens === 'function') {
+        chrome.identity.clearAllCachedAuthTokens(() => {
+          void chrome.runtime?.lastError;
+          resolve();
+        });
+      } else {
+        resolve();
+      }
+    });
+    console.info('[VB Calendar SW]', 'getAuthToken(interactive: true) — выбор аккаунта Google (кэш токенов сброшен)…');
     let token = await VBC.getAuthToken(true);
     if (!token) {
       console.warn('[VB Calendar SW]', 'токен пустой после getAuthToken');

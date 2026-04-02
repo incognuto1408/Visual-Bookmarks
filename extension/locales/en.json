@@ -149,5 +149,8 @@
   "cal.extensionOnly": "Calendar is only available in the Chrome extension",
   "cal.noEvents": "No events today",
   "cal.nextTitle": "Next event",
-  "cal.nextAria": "Next"
+  "cal.nextAria": "Next",
+  "cal.popoverTitle": "Today's events",
+  "cal.closeAria": "Close list",
+  "cal.openEventsAria": "Open all events for today"
 }
