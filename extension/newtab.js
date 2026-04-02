@@ -27,6 +27,9 @@ function sanitizeBookmarkBackgroundColor(raw, fallback = DEFAULT_TILE_BG) {
 
 const STORAGE_KEY = 'visualBookmarks_state_v2';
 const STORAGE_KEY_LEGACY = 'visualBookmarks_state_v1';
+/** Свой фон (data URL) только локально; в основном JSON и на сервере — маркер CUSTOM_BG_MARKER */
+const STORAGE_KEY_CUSTOM_BG = 'visualBookmarks_customBg_dataUrl_v1';
+const CUSTOM_BG_MARKER = '__VB_CUSTOM_BG__';
 const SYNC_FILENAME = 'visual-bookmarks-sync.json';
 const SYNC_DEBOUNCE_MS = 2500;
 /** Интервал между успешными синхронизациями Crypt-Chain (мс); таймер отсчитывается от `lastServerSyncAt` */
@@ -137,6 +140,13 @@ const storageLocal = (() => {
         Object.keys(obj).forEach((k) => {
           localStorage.setItem(k, JSON.stringify(obj[k]));
         });
+      } catch (_) {}
+      queueMicrotask(() => callback && callback());
+    },
+    remove(keys, callback) {
+      try {
+        const list = Array.isArray(keys) ? keys : [keys];
+        list.forEach((k) => localStorage.removeItem(k));
       } catch (_) {}
       queueMicrotask(() => callback && callback());
     },
@@ -366,18 +376,38 @@ function mergeSettings(base, patch) {
 }
 
 /**
- * Пользовательский фон «Загрузить свой фон» хранится как data URL и раздувает JSON.
- * Для экспорта файла, Google Drive и синка с сервером подставляем пресет по умолчанию.
- * Локально в chrome.storage полный фон по-прежнему сохраняется через saveLocal().
+ * Для синка / Drive / API: без data URL. Свой фон — только маркер; файл в STORAGE_KEY_CUSTOM_BG.
  */
 function stripEmbeddedBackgroundForExternal(settings) {
   if (!settings || typeof settings !== 'object') return settings;
   const out = { ...settings };
   const bg = out.background;
-  if (bg && bg.type === 'image' && typeof bg.value === 'string' && bg.value.startsWith('data:')) {
-    out.background = { type: 'preset', value: DEFAULT_SETTINGS.background.value };
+  if (bg && bg.type === 'image' && typeof bg.value === 'string') {
+    if (bg.value.startsWith('data:') || bg.value === CUSTOM_BG_MARKER) {
+      out.background = { type: 'image', value: CUSTOM_BG_MARKER };
+    }
   }
   return out;
+}
+
+/** После merge с сервером/Drive: подставить data URL из локального хранилища или дефолтный пресет */
+function hydrateCustomBackgroundIfNeeded() {
+  return new Promise((resolve) => {
+    const bg = app.settings?.background;
+    if (bg?.type !== 'image' || bg.value !== CUSTOM_BG_MARKER) {
+      resolve();
+      return;
+    }
+    storageLocal.get([STORAGE_KEY_CUSTOM_BG], (res) => {
+      const d = res[STORAGE_KEY_CUSTOM_BG];
+      if (typeof d === 'string' && d.startsWith('data:')) {
+        app.settings = mergeSettings(app.settings, { background: { type: 'image', value: d } });
+      } else {
+        app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
+      }
+      resolve();
+    });
+  });
 }
 
 function sortedBookmarks() {
@@ -390,12 +420,15 @@ function touchUpdated() {
 
 async function loadState() {
   return new Promise((resolve) => {
-    storageLocal.get([STORAGE_KEY, STORAGE_KEY_LEGACY], (res) => {
+    storageLocal.get([STORAGE_KEY, STORAGE_KEY_LEGACY, STORAGE_KEY_CUSTOM_BG], (res) => {
       let raw = res[STORAGE_KEY];
       if (!raw && res[STORAGE_KEY_LEGACY]) {
         const leg = res[STORAGE_KEY_LEGACY];
         raw = migrateLegacy(leg);
       }
+      const customBgStored = res[STORAGE_KEY_CUSTOM_BG];
+      const customBgOk = typeof customBgStored === 'string' && customBgStored.startsWith('data:');
+
       if (raw && typeof raw === 'object') {
         app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, raw.settings || {});
         app.bookmarks = Array.isArray(raw.bookmarks) ? raw.bookmarks.map(normalizeBookmark) : [];
@@ -404,6 +437,20 @@ async function loadState() {
         app.updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : 0;
         app.lastServerSyncAt =
           typeof raw.lastServerSyncAt === 'number' && raw.lastServerSyncAt > 0 ? raw.lastServerSyncAt : null;
+
+        const b = app.settings.background;
+        if (b?.type === 'image' && typeof b.value === 'string' && b.value.startsWith('data:')) {
+          storageLocal.set({ [STORAGE_KEY_CUSTOM_BG]: b.value });
+          app.settings.background = { type: 'image', value: b.value };
+          queueMicrotask(() => void saveLocal());
+        } else if (b?.type === 'image' && b.value === CUSTOM_BG_MARKER) {
+          if (customBgOk) {
+            app.settings.background = { type: 'image', value: customBgStored };
+          } else {
+            app.settings = mergeSettings(app.settings, { background: DEFAULT_SETTINGS.background });
+          }
+        }
+
         if (!app.bookmarks.length) app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
       } else {
         app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
@@ -467,22 +514,47 @@ function bookmarksWithoutFaviconPayload(bookmarks) {
 }
 
 function saveLocal() {
+  const bg = app.settings?.background;
+  const hasCustomDataUrl =
+    bg?.type === 'image' && typeof bg.value === 'string' && bg.value.startsWith('data:');
+
   const payload = {
     updatedAt: app.updatedAt,
     driveFileId: app.driveFileId,
     bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
-    settings: app.settings,
+    settings: hasCustomDataUrl
+      ? mergeSettings(app.settings, { background: { type: 'image', value: CUSTOM_BG_MARKER } })
+      : app.settings,
     user: app.user,
     lastServerSyncAt: typeof app.lastServerSyncAt === 'number' ? app.lastServerSyncAt : null,
   };
-  return new Promise((r) => storageLocal.set({ [STORAGE_KEY]: payload }, r));
+
+  return new Promise((resolve) => {
+    const writeMain = () => {
+      if (hasCustomDataUrl) {
+        storageLocal.set(
+          { [STORAGE_KEY]: payload, [STORAGE_KEY_CUSTOM_BG]: bg.value },
+          resolve
+        );
+      } else {
+        storageLocal.set({ [STORAGE_KEY]: payload }, resolve);
+      }
+    };
+    if (hasCustomDataUrl) {
+      writeMain();
+    } else if (typeof storageLocal.remove === 'function') {
+      storageLocal.remove([STORAGE_KEY_CUSTOM_BG], writeMain);
+    } else {
+      writeMain();
+    }
+  });
 }
 
 function exportJsonString() {
   return JSON.stringify(
     {
       bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
-      settings: stripEmbeddedBackgroundForExternal(app.settings),
+      settings: JSON.parse(JSON.stringify(app.settings)),
       user: app.user,
       updatedAt: app.updatedAt,
       version: 2,
@@ -506,6 +578,9 @@ function resetDefaults() {
   app.settings = { ...DEFAULT_SETTINGS };
   app.user = null;
   app.lastServerSyncAt = null;
+  if (typeof storageLocal.remove === 'function') {
+    storageLocal.remove([STORAGE_KEY_CUSTOM_BG], () => {});
+  }
   touchUpdated();
 }
 
@@ -645,6 +720,39 @@ async function applyServerStateAfterAuth(opts = {}) {
 }
 
 /**
+ * Серверный updatedAt → миллисекунды Unix (как Date.now()).
+ * Часто на бэкенде: секунды, ISO-8601 в UTC («…Z»), строка-число — иначе сравнение с локальным временем ломается.
+ */
+function remoteUpdatedAtField(remote) {
+  if (!remote || typeof remote !== 'object') return undefined;
+  if (remote.updatedAt != null) return remote.updatedAt;
+  if (remote.updated_at != null) return remote.updated_at;
+  return undefined;
+}
+
+function normalizeServerUpdatedAt(raw) {
+  if (raw == null || raw === '') return 0;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    let n = raw;
+    if (n > 0 && n < 1e12) n *= 1000;
+    return Math.round(n);
+  }
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (!t) return 0;
+    const parsed = Date.parse(t);
+    if (Number.isFinite(parsed)) return parsed;
+    const num = Number(t);
+    if (Number.isFinite(num)) {
+      let n = num;
+      if (n > 0 && n < 1e12) n *= 1000;
+      return Math.round(n);
+    }
+  }
+  return 0;
+}
+
+/**
  * Слияние с сервером Crypt-Chain.
  * @param {{ allowSeedPush?: boolean }} opts — allowSeedPush: при 204 один раз отправить локальное состояние (вход, ручная синхронизация); false для таймера, чтобы не дёргать PUT каждую минуту.
  */
@@ -655,8 +763,18 @@ async function pullServerMerge(opts = {}) {
   if (remote == null) {
     if (allowSeedPush && (app.bookmarks.length || app.updatedAt)) await pushServerState();
   } else {
-    const ru = typeof remote.updatedAt === 'number' ? remote.updatedAt : 0;
-    if (ru > app.updatedAt) {
+    const ruNorm = normalizeServerUpdatedAt(remoteUpdatedAtField(remote));
+    let ru = ruNorm;
+    if (
+      ru <= 0 &&
+      (Array.isArray(remote.bookmarks) || (remote.settings && typeof remote.settings === 'object'))
+    ) {
+      ru = app.updatedAt;
+    }
+
+    if (app.updatedAt > ru) {
+      await pushServerState();
+    } else {
       if (Array.isArray(remote.bookmarks)) {
         const mapped = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
         app.bookmarks =
@@ -668,14 +786,15 @@ async function pullServerMerge(opts = {}) {
           stripEmbeddedBackgroundForExternal(remote.settings)
         );
       }
-      app.updatedAt = ru;
+      if (ruNorm > 0) {
+        app.updatedAt = ruNorm;
+      }
       syncMaxBookmarksToStoredCount();
       if (await enrichFaviconBackgrounds()) touchUpdated();
       renderAll();
-    } else if (app.updatedAt > ru) {
-      await pushServerState();
     }
   }
+  await hydrateCustomBackgroundIfNeeded();
   app.lastServerSyncAt = Date.now();
   await saveLocal();
 }
@@ -792,6 +911,7 @@ async function pullDriveMerge(token) {
       );
     }
     app.updatedAt = ru;
+    await hydrateCustomBackgroundIfNeeded();
     syncMaxBookmarksToStoredCount();
     if (await enrichFaviconBackgrounds()) touchUpdated();
     await saveLocal();
@@ -1563,13 +1683,13 @@ function renderSettingsPanels() {
       .map(
         (bg) =>
           '<button type="button" class="bg-thumb' +
-          (s.background?.value === bg.value ? ' is-selected' : '') +
+          (s.background?.type === 'preset' && s.background?.value === bg.value ? ' is-selected' : '') +
           '" data-bg-preset="' +
           escapeAttr(bg.value) +
           '"><img src="' +
           escapeAttr(bg.value) +
           '" alt=""/>' +
-          (s.background?.value === bg.value ? '<span class="check">✓</span>' : '') +
+          (s.background?.type === 'preset' && s.background?.value === bg.value ? '<span class="check">✓</span>' : '') +
           '</button>'
       )
       .join('') +
@@ -2353,6 +2473,7 @@ async function init() {
     f.text().then(async (text) => {
       try {
         importFromJson(text);
+        await hydrateCustomBackgroundIfNeeded();
         await persist(true);
         hideModal('modalSettings');
         void (async () => {

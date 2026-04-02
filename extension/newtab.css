@@ -251,12 +251,18 @@ body {
 
 .search-engine {
   position: relative;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
 }
 
 .search-engine__btn {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex: 1;
+  min-height: 2.75rem;
+  height: 100%;
   padding: 0.75rem;
   border-radius: var(--radius-xl) 0 0 var(--radius-xl);
   border: 1px solid rgba(255, 255, 255, 0.2);
@@ -339,6 +345,10 @@ body {
 }
 
 .search-submit {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 0.75rem 1rem;
   border-radius: 0 var(--radius-xl) var(--radius-xl) 0;
   border: 1px solid rgba(255, 255, 255, 0.2);
