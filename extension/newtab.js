@@ -1037,6 +1037,30 @@ async function performCryptChainLogout() {
   await persist(false, { skipTouchUpdated: skipTouchAfterPush });
 }
 
+/** Сервер отклонил токен (401 / просрочен): без повторного push, только UI и локальный снимок. */
+async function onCryptChainSessionInvalidatedByServer() {
+  stopServerPeriodicPull();
+  app.user = null;
+  app.lastServerSyncAt = null;
+  profileMenuOpen = false;
+  try {
+    await clearCryptChainSessionStorage();
+  } catch (_) {}
+  try {
+    await saveLocal();
+  } catch (_) {}
+  try {
+    renderAll();
+    renderHeader();
+    renderSettingsIfOpen();
+  } catch (_) {}
+  try {
+    alert(tr('auth.sessionExpired'));
+  } catch (_) {
+    alert('Сессия недействительна. Войдите снова.');
+  }
+}
+
 /**
  * После входа или регистрации Crypt-Chain.
  * Вход: подтягиваем сервер и сливаем с локальным по `updatedAt` (как ручная синхронизация).
@@ -3798,6 +3822,12 @@ async function init() {
         })();
       }, 4000);
     })();
+  });
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('vb-session-invalid', () => {
+    void onCryptChainSessionInvalidatedByServer();
   });
 }
 

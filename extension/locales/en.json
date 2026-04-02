@@ -64,6 +64,7 @@
   "auth.submitRegister": "Register",
   "auth.placeholderName": "John Doe",
   "auth.note": "Sign-in and registration use Crypt-Chain (fixed API). Login page: ",
+  "auth.sessionExpired": "Your session is invalid or has expired. Please sign in again.",
   "set.tabAppearance": "Appearance",
   "set.tabBookmarks": "Bookmarks",
   "set.tabSystem": "System",

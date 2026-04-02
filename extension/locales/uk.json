@@ -64,6 +64,7 @@
   "auth.submitRegister": "Зареєструватися",
   "auth.placeholderName": "Іван Іваненко",
   "auth.note": "Вхід і реєстрація через сервіс Crypt-Chain (фіксована адреса API). Сторінка входу: ",
+  "auth.sessionExpired": "Сесію недійсну або прострочено. Увійдіть знову.",
   "set.tabAppearance": "Оформлення",
   "set.tabBookmarks": "Закладки",
   "set.tabSystem": "Система",

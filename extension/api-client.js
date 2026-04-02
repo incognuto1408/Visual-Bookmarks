@@ -10,7 +10,40 @@
     TOKEN: 'vb_server_access_token',
     USER: 'vb_server_user_json',
     BASE: 'vb_server_base_url',
+    /** Стабильный ID профиля расширения; не удаляется при выходе — для отдельного токена на устройство на бэкенде */
+    DEVICE_CLIENT: 'vb_browser_device_id',
   };
+
+  function messageLooksLikeInvalidToken(text) {
+    const s = String(text || '').toLowerCase();
+    const authish = /токен|token|сесс|session|auth|credential|bearer/.test(s);
+    const bad = /недействител|просрочен|ист[ёе]к|invalid|expired|unauthor|unauthenticated|forbidden/.test(s);
+    return authish && bad;
+  }
+
+  async function clearSessionAndNotifyInvalid() {
+    await storageRemove([K.TOKEN, K.USER]);
+    try {
+      if (typeof window !== 'undefined' && window.dispatchEvent) {
+        window.dispatchEvent(new CustomEvent('vb-session-invalid'));
+      }
+    } catch (_) {}
+  }
+
+  async function getOrCreateDeviceId() {
+    const x = await storageGet([K.DEVICE_CLIENT]);
+    let id = x[K.DEVICE_CLIENT];
+    if (id != null && String(id).trim() !== '') return String(id).trim();
+    let gen = '';
+    try {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        gen = crypto.randomUUID();
+      }
+    } catch (_) {}
+    if (!gen) gen = 'vb_' + Date.now() + '_' + Math.random().toString(36).slice(2, 14);
+    await storageSet({ [K.DEVICE_CLIENT]: gen });
+    return gen;
+  }
 
   function storageGet(keys) {
     return new Promise((resolve) => {
@@ -216,10 +249,11 @@
     const base = await getServerUrl();
     const ok = await requestHostPermissionForBase(base);
     if (!ok) throw new Error('Нет доступа к домену API (разрешите запрос Chrome)');
+    const deviceId = await getOrCreateDeviceId();
     const res = await fetch(base + '/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, device_id: deviceId }),
     });
     if (!res.ok) throw new Error(await parseErrorResponse(res));
     const raw = await res.json();
@@ -233,6 +267,7 @@
     const base = await getServerUrl();
     const ok = await requestHostPermissionForBase(base);
     if (!ok) throw new Error('Нет доступа к домену API (разрешите запрос Chrome)');
+    const deviceId = await getOrCreateDeviceId();
     const res = await fetch(base + '/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -240,6 +275,7 @@
         email: payload.email,
         password: payload.password,
         name: payload.name || payload.email.split('@')[0],
+        device_id: deviceId,
       }),
     });
     if (!res.ok) throw new Error(await parseErrorResponse(res));
@@ -265,12 +301,22 @@
       headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
     });
     if (res.status === 404 || res.status === 204) return null;
-    if (res.status === 401) {
-      await logout();
+    if (res.status === 401 || res.status === 403) {
+      await clearSessionAndNotifyInvalid();
       throw new Error('Сессия истекла — войдите снова');
     }
-    if (!res.ok) throw new Error(await parseErrorResponse(res));
+    if (!res.ok) {
+      const msg = await parseErrorResponse(res);
+      if (messageLooksLikeInvalidToken(msg)) {
+        await clearSessionAndNotifyInvalid();
+      }
+      throw new Error(msg);
+    }
     const raw = await res.json();
+    if (raw && typeof raw === 'object' && raw.status === false && messageLooksLikeInvalidToken(String(raw.message || ''))) {
+      await clearSessionAndNotifyInvalid();
+      throw new Error(String(raw.message || 'Сессия истекла — войдите снова'));
+    }
     try {
       return normalizeCryptChainBody(raw);
     } catch (e) {
@@ -294,11 +340,28 @@
       },
       body: JSON.stringify(body),
     });
-    if (res.status === 401) {
-      await logout();
+    if (res.status === 401 || res.status === 403) {
+      await clearSessionAndNotifyInvalid();
       throw new Error('Сессия истекла — войдите снова');
     }
-    if (!res.ok) throw new Error(await parseErrorResponse(res));
+    let rawBody = null;
+    try {
+      const ct = res.headers.get('content-type');
+      if (ct && ct.includes('application/json')) {
+        rawBody = await res.clone().json();
+      }
+    } catch (_) {}
+    if (rawBody && rawBody.status === false && messageLooksLikeInvalidToken(String(rawBody.message || ''))) {
+      await clearSessionAndNotifyInvalid();
+      throw new Error(String(rawBody.message || 'Сессия истекла — войдите снова'));
+    }
+    if (!res.ok) {
+      const msg = await parseErrorResponse(res);
+      if (messageLooksLikeInvalidToken(msg)) {
+        await clearSessionAndNotifyInvalid();
+      }
+      throw new Error(msg);
+    }
   }
 
   global.VisualBookmarksApi = {

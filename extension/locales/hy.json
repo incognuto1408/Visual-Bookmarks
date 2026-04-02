@@ -64,6 +64,7 @@
   "auth.submitRegister": "Գրանցվել",
   "auth.placeholderName": "Անուն Ազգանուն",
   "auth.note": "Մուտքը և գրանցումը Crypt-Chain-ի միջոցով (ֆիքսված API)։ Մուտքի էջ՝ ",
+  "auth.sessionExpired": "Նիստը անվավեր է կամ սպառվել է։ Մուտք գործեք կրկին։",
   "set.tabAppearance": "Տեսք",
   "set.tabBookmarks": "Էջանիշներ",
   "set.tabSystem": "Համակարգ",

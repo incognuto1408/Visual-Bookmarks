@@ -64,6 +64,7 @@
   "auth.submitRegister": "Зарегистрироваться",
   "auth.placeholderName": "Иван Иванов",
   "auth.note": "Вход и регистрация выполняются через сервис Crypt-Chain (фиксированный адрес API). Информация о входе на сайте: ",
+  "auth.sessionExpired": "Сессия недействительна или истекла. Войдите снова.",
   "set.tabAppearance": "Оформление",
   "set.tabBookmarks": "Закладки",
   "set.tabSystem": "Система",
