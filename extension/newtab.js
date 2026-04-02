@@ -415,6 +415,38 @@ function normalizeUrl(raw) {
   return 'https://' + t;
 }
 
+/**
+ * Валидный http(s) URL для закладки или null. Без схемы подставляется https://.
+ * Отклоняет javascript:, data:, пустой хост, непарсящийся ввод.
+ */
+function tryNormalizeBookmarkUrl(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return null;
+  const compact = t.replace(/\s/g, '');
+  if (!compact) return null;
+  const candidate = /^https?:\/\//i.test(compact) ? compact : 'https://' + compact;
+  let u;
+  try {
+    u = new URL(candidate);
+  } catch {
+    return null;
+  }
+  const p = u.protocol.toLowerCase();
+  if (p !== 'http:' && p !== 'https:') return null;
+  const host = u.hostname;
+  if (!host || /\s/.test(host)) return null;
+  return u.href;
+}
+
+function defaultBookmarkTitleFromUrl(canonicalUrl) {
+  try {
+    const h = new URL(canonicalUrl).hostname.replace(/^www\./i, '');
+    return h || canonicalUrl;
+  } catch {
+    return canonicalUrl;
+  }
+}
+
 function hostFromUrl(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, '');
@@ -3585,19 +3617,17 @@ async function init() {
     const btn = $('bmSubmit');
     if (btn.disabled) return;
 
-    const title = $('bmTitle').value.trim();
-    const url = normalizeUrl($('bmUrl').value.trim());
-    const desc = $('bmDesc').value.trim();
-    if (!title) {
-      alert(tr('alert.bmTitle'));
-      $('bmTitle').focus();
-      return;
-    }
+    const url = tryNormalizeBookmarkUrl($('bmUrl').value);
     if (!url) {
-      alert(tr('alert.bmUrl'));
+      alert(tr('alert.bmUrlInvalid'));
       $('bmUrl').focus();
       return;
     }
+    let title = $('bmTitle').value.trim();
+    if (!title) {
+      title = defaultBookmarkTitleFromUrl(url);
+    }
+    const desc = $('bmDesc').value.trim();
 
     const fromFavicon = bmAutoColor || (!editingBookmarkId && !bmColorUserTouched);
     let bg = sanitizeBookmarkBackgroundColor($('bmColorPicker').value, DEFAULT_TILE_BG);
