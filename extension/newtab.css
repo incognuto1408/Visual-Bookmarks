@@ -4,6 +4,8 @@
   --radius-xl: 1rem;
   --z-modal: 50;
   --z-header: 30;
+  /* Шапка и выпадашка профиля: выше .calendar-widget-root (35), иначе клики не доходят до «Выйти» */
+  --z-header-app: 45;
 }
 
 *,
@@ -65,8 +67,8 @@ body {
   pointer-events: none;
 }
 
-/* #calendarWidgetRoot — position: fixed снизу справа; не задавать ему relative */
-.app > :not(.page-bg):not(.page-overlay):not(#calendarWidgetRoot) {
+/* #calendarWidgetRoot — fixed; .header — свой z-index (--z-header-app), иначе здесь перебивается z-index: 2 */
+.app > :not(.page-bg):not(.page-overlay):not(#calendarWidgetRoot):not(.header) {
   position: relative;
   z-index: 2;
 }
@@ -107,7 +109,7 @@ body {
   top: 0;
   left: 0;
   right: 0;
-  z-index: var(--z-header);
+  z-index: var(--z-header-app);
   padding: 1rem;
 }
 
@@ -183,6 +185,7 @@ body {
   right: 0;
   top: calc(100% + 0.5rem);
   min-width: 180px;
+  z-index: 1;
   background: #18181b;
   border: 1px solid #3f3f46;
   border-radius: var(--radius-lg);
@@ -390,16 +393,6 @@ body {
 
 .bookmarks-bar__link:hover {
   background: rgba(0, 0, 0, 0.5);
-}
-
-.context-suggestions {
-  width: 100%;
-  max-width: 42rem;
-  margin-bottom: 1rem;
-  padding: 0.5rem 1rem;
-  font-size: 0.8rem;
-  color: rgba(255, 255, 255, 0.55);
-  text-align: center;
 }
 
 .info-panel {

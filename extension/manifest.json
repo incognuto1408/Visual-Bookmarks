@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Visual Bookmarks StabilityInternational",
   "version": "2.2.0",
-  "description": "Визуальные закладки Stability International: сетка, фон, синхронизация с Crypt-Chain или Google Drive.",
+  "description": "Визуальные закладки Stability International: сетка, фон, синхронизация с Crypt-Chain.",
   "chrome_url_overrides": {
     "newtab": "newtab.html"
   },
@@ -17,10 +17,7 @@
   },
   "oauth2": {
     "client_id": "315927633254-knl0p5tu8uu0kli79pe6c3154tuahctb.apps.googleusercontent.com",
-    "scopes": [
-      "https://www.googleapis.com/auth/drive.appdata",
-      "https://www.googleapis.com/auth/calendar.readonly"
-    ]
+    "scopes": ["https://www.googleapis.com/auth/calendar.readonly"]
   },
   "icons": {
     "48": "icons/icon48.png",

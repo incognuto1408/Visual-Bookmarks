@@ -41,11 +41,9 @@ const LOCAL_BOOT_CACHE_KEY = 'visualBookmarks_newtab_boot_v1';
 const LOCAL_BOOT_BG_KEY = 'visualBookmarks_newtab_boot_bg_v1';
 const MAX_BOOT_BG_STORAGE_CHARS = 2_000_000;
 const BOOT_CACHE_VERSION = 1;
-const SYNC_FILENAME = 'visual-bookmarks-sync.json';
 const SYNC_DEBOUNCE_MS = 2500;
 /** Интервал между успешными синхронизациями Crypt-Chain (мс); таймер отсчитывается от `lastServerSyncAt` */
 const SERVER_PULL_INTERVAL_MS = 60 * 1000;
-const MIME_JSON = 'application/json; charset=UTF-8';
 
 const PRESET_BACKGROUNDS = [
   { id: 'earth', value: 'https://images.unsplash.com/photo-1451186859696-371d9477be93?w=1920&q=80' },
@@ -98,7 +96,6 @@ const DEFAULT_SETTINGS = {
   maxBookmarks: 100,
   bookmarkView: 'icons',
   showBookmarksBar: false,
-  showContextSuggestions: true,
   showInfoPanel: false,
   showStabilityInfo: false,
   /** false — поиск и закладки открываются в этой же вкладке */
@@ -109,7 +106,7 @@ const DEFAULT_SETTINGS = {
   _lastBgDay: null,
   /** Виджет Google Календаря на новой вкладке */
   showCalendar: true,
-  /** Пользователь прошёл OAuth и хочет показывать события (токен общий с Drive) */
+  /** Пользователь прошёл OAuth и хочет показывать события календаря */
   googleCalendarEnabled: false,
 };
 
@@ -181,10 +178,9 @@ function isExtensionContext() {
   return typeof chrome !== 'undefined' && !!(chrome.runtime && chrome.runtime.id);
 }
 
-/** @type {{ updatedAt: number; driveFileId: string | null; bookmarks: any[]; settings: typeof DEFAULT_SETTINGS; user: any | null; lastServerSyncAt: number | null }} */
+/** @type {{ updatedAt: number; bookmarks: any[]; settings: typeof DEFAULT_SETTINGS; user: any | null; lastServerSyncAt: number | null }} */
 let app = {
   updatedAt: 0,
-  driveFileId: null,
   bookmarks: [],
   settings: { ...DEFAULT_SETTINGS },
   user: null,
@@ -418,7 +414,7 @@ function mergeSettings(base, patch) {
 }
 
 /**
- * Для синка / Drive / API: без data URL. Свой фон — только маркер; файл в STORAGE_KEY_CUSTOM_BG.
+ * Для синка / API: без data URL. Свой фон — только маркер; файл в STORAGE_KEY_CUSTOM_BG.
  */
 function stripEmbeddedBackgroundForExternal(settings) {
   if (!settings || typeof settings !== 'object') return settings;
@@ -432,7 +428,7 @@ function stripEmbeddedBackgroundForExternal(settings) {
   return out;
 }
 
-/** После merge с сервером/Drive: подставить data URL из локального хранилища или дефолтный пресет */
+/** После merge с сервером: подставить data URL из локального хранилища или дефолтный пресет */
 function hydrateCustomBackgroundIfNeeded() {
   return new Promise((resolve) => {
     const bg = app.settings?.background;
@@ -489,7 +485,6 @@ async function loadState() {
         app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, raw.settings || {});
         app.bookmarks = Array.isArray(raw.bookmarks) ? raw.bookmarks.map(normalizeBookmark) : [];
         app.user = raw.user || null;
-        app.driveFileId = raw.driveFileId ?? null;
         app.updatedAt = typeof raw.updatedAt === 'number' ? raw.updatedAt : 0;
         app.lastServerSyncAt =
           typeof raw.lastServerSyncAt === 'number' && raw.lastServerSyncAt > 0 ? raw.lastServerSyncAt : null;
@@ -513,7 +508,6 @@ async function loadState() {
         app.settings = { ...DEFAULT_SETTINGS };
         app.updatedAt = 0;
         app.user = null;
-        app.driveFileId = null;
         app.lastServerSyncAt = null;
       }
       syncMaxBookmarksToStoredCount();
@@ -531,7 +525,6 @@ function writeBootCacheFromPayload(payload) {
   const mirror = {
     v: BOOT_CACHE_VERSION,
     updatedAt: payload.updatedAt,
-    driveFileId: payload.driveFileId ?? null,
     bookmarks: payload.bookmarks,
     settings: payload.settings,
     user: payload.user ?? null,
@@ -575,7 +568,6 @@ function tryApplyBootCache() {
   app.bookmarks = o.bookmarks.map(normalizeBookmark).filter(Boolean);
   if (!app.bookmarks.length) app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
   app.user = o.user || null;
-  app.driveFileId = o.driveFileId ?? null;
   app.updatedAt = o.updatedAt;
   app.lastServerSyncAt =
     typeof o.lastServerSyncAt === 'number' && o.lastServerSyncAt > 0 ? o.lastServerSyncAt : null;
@@ -607,7 +599,6 @@ function migrateLegacy(leg) {
   }));
   return {
     updatedAt: leg.updatedAt || Date.now(),
-    driveFileId: leg.driveFileId ?? null,
     bookmarks: bms,
     settings: { ...DEFAULT_SETTINGS },
     user: null,
@@ -636,7 +627,7 @@ function normalizeBookmark(b) {
   };
 }
 
-/** Для синка / экспорта / Drive / chrome.storage — без data URL иконок */
+/** Для синка / экспорта / chrome.storage — без data URL иконок */
 function bookmarksWithoutFaviconPayload(bookmarks) {
   return bookmarks.map((b) => {
     const o = { ...b };
@@ -652,7 +643,6 @@ function saveLocal() {
 
   const payload = {
     updatedAt: app.updatedAt,
-    driveFileId: app.driveFileId,
     bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
     settings: hasCustomDataUrl
       ? mergeSettings(app.settings, { background: { type: 'image', value: CUSTOM_BG_MARKER } })
@@ -742,87 +732,6 @@ function resetDefaults() {
   touchUpdated();
 }
 
-/* --- Google Drive --- */
-function getToken(interactive) {
-  return new Promise((resolve, reject) => {
-    if (typeof chrome === 'undefined' || !chrome.identity || typeof chrome.identity.getAuthToken !== 'function') {
-      reject(new Error('Google OAuth доступен только внутри расширения Chrome'));
-      return;
-    }
-    chrome.identity.getAuthToken({ interactive }, (token) => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve(token);
-    });
-  });
-}
-
-async function driveListFile(token) {
-  const q = encodeURIComponent("name='" + SYNC_FILENAME + "' and trashed=false");
-  const url = 'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=' + q + '&fields=files(id,modifiedTime)';
-  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-  if (!r.ok) throw new Error(await r.text());
-  const j = await r.json();
-  return j.files || [];
-}
-
-async function driveCreateFile(token, bodyStr) {
-  const boundary = 'vb_' + Date.now();
-  const meta = JSON.stringify({ name: SYNC_FILENAME, parents: ['appDataFolder'] });
-  const body = ['--' + boundary, 'Content-Type: ' + MIME_JSON, '', meta, '--' + boundary, 'Content-Type: ' + MIME_JSON, '', bodyStr, '--' + boundary + '--', ''].join('\r\n');
-  const r = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
-    method: 'POST',
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'multipart/related; boundary=' + boundary },
-    body,
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-async function drivePatchContent(token, fileId, bodyStr) {
-  const url = 'https://www.googleapis.com/upload/drive/v3/files/' + encodeURIComponent(fileId) + '?uploadType=media';
-  const r = await fetch(url, { method: 'PATCH', headers: { Authorization: 'Bearer ' + token, 'Content-Type': MIME_JSON }, body: bodyStr });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-async function driveDownload(token, fileId) {
-  const url = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media';
-  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-  if (!r.ok) throw new Error(await r.text());
-  return r.text();
-}
-
-function drivePayload() {
-  return JSON.stringify(
-    {
-      version: 2,
-      updatedAt: app.updatedAt,
-      bookmarks: bookmarksWithoutFaviconPayload(app.bookmarks),
-      settings: stripEmbeddedBackgroundForExternal(app.settings),
-    },
-    null,
-    2
-  );
-}
-
-async function pushDrive(token) {
-  const body = drivePayload();
-  if (app.driveFileId) {
-    await drivePatchContent(token, app.driveFileId, body);
-    return;
-  }
-  const files = await driveListFile(token);
-  if (files.length) {
-    app.driveFileId = files[0].id;
-    await drivePatchContent(token, app.driveFileId, body);
-    await saveLocal();
-    return;
-  }
-  const c = await driveCreateFile(token, body);
-  app.driveFileId = c.id;
-  await saveLocal();
-}
-
 function normalizeServerUser(u) {
   if (!u) return null;
   const name = u.name || (u.email && u.email.split('@')[0]) || 'User';
@@ -851,15 +760,29 @@ async function pushServerState() {
  * Выход из Crypt-Chain: закладки и настройки (кроме календаря) остаются локально.
  * Сбрасываются токен/пользователь сервера и привязка Google Календаря в расширении.
  */
+/** Ключи сессии Crypt-Chain (дублируют api-client.js) — всегда снимаем при выходе, даже если API-скрипт недоступен. */
+const CRYPT_CHAIN_SESSION_KEYS = ['vb_server_access_token', 'vb_server_user_json', 'vb_server_base_url'];
+
+function clearCryptChainSessionStorage() {
+  return new Promise((resolve) => {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local?.remove) {
+      chrome.storage.local.remove(CRYPT_CHAIN_SESSION_KEYS, () => resolve());
+    } else {
+      resolve();
+    }
+  });
+}
+
 async function performCryptChainLogout() {
   stopServerPeriodicPull();
   try {
-    if (typeof VisualBookmarksApi !== 'undefined') {
+    if (typeof VisualBookmarksApi !== 'undefined' && VisualBookmarksApi.logout) {
       await VisualBookmarksApi.logout();
     }
   } catch (e) {
     console.warn('Crypt-Chain logout:', e);
   }
+  await clearCryptChainSessionStorage();
   app.user = null;
   app.lastServerSyncAt = null;
   profileMenuOpen = false;
@@ -1059,29 +982,20 @@ async function pullRemoteMerge() {
   } catch (e) {
     console.warn('Server sync:', e);
   }
-  try {
-    const t = await getToken(false);
-    return await pullDriveMerge(t);
-  } catch (_) {}
   return false;
 }
 
-/** Один проход: Crypt-Chain при активной сессии, иначе тихий push в Google Drive. Без ожидания из UI. */
+/** Один проход: Crypt-Chain при активной сессии. Без ожидания из UI. */
 async function pushRemoteStateOnce() {
   try {
     if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
       await pushServerState();
       app.lastServerSyncAt = Date.now();
       await saveLocal();
-      return;
     }
   } catch (e) {
     console.warn('Сервер синхронизации:', e);
   }
-  try {
-    const t = await getToken(false);
-    await pushDrive(t);
-  } catch (_) {}
 }
 
 const debouncedPush = debounce(() => {
@@ -1096,39 +1010,8 @@ function debounce(fn, ms) {
   };
 }
 
-/** @returns {Promise<boolean>} был ли полный renderAll */
-async function pullDriveMerge(token) {
-  const files = await driveListFile(token);
-  if (!files.length) {
-    if (app.bookmarks.length) await pushDrive(token);
-    return false;
-  }
-  app.driveFileId = files[0].id;
-  const text = await driveDownload(token, app.driveFileId);
-  const remote = JSON.parse(text);
-  const ru = remote.updatedAt || 0;
-  if (ru > app.updatedAt) {
-    if (remote.bookmarks) app.bookmarks = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
-    if (remote.settings) {
-      app.settings = mergeSettings(
-        { ...DEFAULT_SETTINGS },
-        stripEmbeddedBackgroundForExternal(remote.settings)
-      );
-    }
-    app.updatedAt = ru;
-    await hydrateCustomBackgroundIfNeeded();
-    syncMaxBookmarksToStoredCount();
-    if (await enrichFaviconBackgrounds()) touchUpdated();
-    await saveLocal();
-    renderAll();
-    return true;
-  }
-  if (app.updatedAt > ru) await pushDrive(token);
-  return false;
-}
-
 /**
- * Локально: сразу сохраняет и перерисовывает. Сеть (сервер / Drive) — только в фоне, без блокировки UI.
+ * Локально: сразу сохраняет и перерисовывает. Сеть (Crypt-Chain) — только в фоне, без блокировки UI.
  * @param {boolean} [immediateServerPush] — поставить фоновую отправку сразу (иначе debounce 2,5 с).
  */
 async function persist(immediateServerPush = false) {
@@ -1732,16 +1615,6 @@ function openExternalUrl(url) {
   }
 }
 
-function renderContextSuggestions() {
-  const el = $('contextSuggestions');
-  if (!app.settings.showContextSuggestions) {
-    el.classList.add('is-hidden');
-    return;
-  }
-  el.classList.remove('is-hidden');
-  el.textContent = 'Контекстные предложения: откройте настройки, чтобы скрыть эту строку.';
-}
-
 function renderInfoPanel() {
   const el = $('infoPanel');
   if (!app.settings.showInfoPanel) {
@@ -2264,9 +2137,6 @@ function renderSettingsPanels() {
     '<label class="settings-check"><input type="checkbox" id="chkSearch"' +
     (s.showSearch !== false ? ' checked' : '') +
     '/><span>Поисковая строка</span></label>' +
-    '<label class="settings-check"><input type="checkbox" id="chkCtx"' +
-    (s.showContextSuggestions !== false ? ' checked' : '') +
-    '/><span>Контекстные предложения</span></label>' +
     '<label class="settings-check"><input type="checkbox" id="chkInfo"' +
     (s.showInfoPanel ? ' checked' : '') +
     '/><span>Показывать информационную панель</span></label>' +
@@ -2283,7 +2153,7 @@ function renderSettingsPanels() {
     (s.showCalendar !== false
       ? '<section class="mb-6">' +
         '<h2 class="settings-section-title">Google Календарь</h2>' +
-        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">События на сегодня из основного календаря (primary). Используется тот же OAuth Client ID, что и для Google Drive, плюс scope <code style="font-size:0.75rem">calendar.readonly</code> в manifest. В консоли Google Cloud включите <strong>Google Calendar API</strong>.</p>' +
+        '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">События на сегодня из основного календаря (primary). OAuth через <code style="font-size:0.75rem">chrome.identity</code>, scope <code style="font-size:0.75rem">calendar.readonly</code> в manifest. В консоли Google Cloud включите <strong>Google Calendar API</strong>.</p>' +
         '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.75rem">' +
         (s.googleCalendarEnabled
           ? '<span class="settings-calendar-status settings-calendar-status--ok">Календарь подключен</span>' +
@@ -2366,12 +2236,6 @@ function renderSettingsPanels() {
     '<button type="button" class="backup-btn" id="btnServerSync">Синхронизировать</button>' +
     '<button type="button" class="backup-btn" id="btnServerLogout">Выйти из аккаунта</button></div>' +
     '<p id="serverApiStatus" style="font-size:0.75rem;color:#6b7280;margin:0"></p></div></section>' +
-    '<section class="mb-6"><h2 class="settings-section-title">Google Drive</h2>' +
-    '<p style="font-size:0.8rem;color:#6b7280;margin:0 0 0.75rem">Синхронизация, если не используете сервер (при активной сессии сервера Drive не вызывается).</p>' +
-    '<div style="display:flex;flex-wrap:wrap;gap:0.5rem">' +
-    '<button type="button" class="backup-btn" id="btnDriveLogin">Войти и синхронизировать</button>' +
-    '<button type="button" class="backup-btn" id="btnDriveLogout">Выйти из Google</button></div>' +
-    '<p id="driveStatus" style="font-size:0.75rem;color:#6b7280;margin-top:0.5rem"></p></section>' +
     '<section class="mb-6"><h2 class="settings-section-title">Резервное копирование</h2>' +
     '<div class="backup-btns">' +
     '<button type="button" class="backup-btn" id="backupSave">Сохранить в файл</button>' +
@@ -2417,11 +2281,10 @@ function wireSettingsAppearance(totalPages) {
     persist();
     renderSettingsIfOpen();
   });
-  ['chkBar', 'chkSearch', 'chkCtx', 'chkInfo', 'chkStab', 'chkNewTab', 'chkCalendar'].forEach((id, i) => {
+  ['chkBar', 'chkSearch', 'chkInfo', 'chkStab', 'chkNewTab', 'chkCalendar'].forEach((id, i) => {
     const keys = [
       'showBookmarksBar',
       'showSearch',
-      'showContextSuggestions',
       'showInfoPanel',
       'showStabilityInfo',
       'openLinksInNewTab',
@@ -2538,15 +2401,20 @@ function wireSettingsSystem() {
     renderSettingsIfOpen();
   });
 
-  $('btnServerLogout').addEventListener('click', async () => {
+  $('btnServerLogout').addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
     const stEl = $('serverApiStatus');
     stEl.textContent = 'Выход…';
     try {
       await performCryptChainLogout();
       stEl.textContent = 'Вы вышли из аккаунта. Закладки и настройки сохранены, календарь отключён.';
-    } catch (e) {
-      console.warn('Выход из аккаунта:', e);
-      stEl.textContent = e.message || String(e);
+    } catch (err) {
+      console.warn('Выход из аккаунта:', err);
+      stEl.textContent = err.message || String(err);
+    } finally {
+      renderHeader();
+      renderAll();
     }
   });
 
@@ -2575,38 +2443,6 @@ function wireSettingsSystem() {
         }
       } catch (_) {}
     })();
-  });
-  const status = $('driveStatus');
-  getToken(false)
-    .then(() => {
-      status.textContent = 'Google: активна сессия';
-    })
-    .catch(() => {
-      status.textContent = '';
-    });
-  $('btnDriveLogin').addEventListener('click', async () => {
-    const cid = getExtensionManifest().oauth2?.client_id ?? '';
-    if (cid.includes('REPLACE_WITH_YOUR')) {
-      status.textContent = 'Укажите oauth2.client_id в manifest.json (см. README)';
-      return;
-    }
-    try {
-      const t = await getToken(true);
-      await pullDriveMerge(t);
-      status.textContent = 'Синхронизация выполнена';
-      renderAll();
-    } catch (e) {
-      status.textContent = e.message || String(e);
-    }
-  });
-  $('btnDriveLogout').addEventListener('click', () => {
-    if (chrome?.identity?.clearAllCachedAuthTokens) {
-      chrome.identity.clearAllCachedAuthTokens(() => {
-        status.textContent = 'Вы вышли из Google';
-      });
-    } else {
-      status.textContent = 'Доступно только в расширении';
-    }
   });
 }
 
@@ -2655,7 +2491,6 @@ function renderAll() {
   renderHeader();
   renderSearch();
   renderBookmarksBar();
-  renderContextSuggestions();
   renderInfoPanel();
   renderGrid();
   renderCalendarWidget();
@@ -2787,7 +2622,9 @@ async function init() {
       : Promise.resolve(),
   ]);
   if (cryptSession.hasToken && cryptSession.user) {
-    app.user = normalizeServerUser(cryptSession.user);
+    if (app.user == null) {
+      app.user = normalizeServerUser(cryptSession.user);
+    }
   }
 
   if (!shownFromBoot) {
@@ -2812,11 +2649,16 @@ async function init() {
     renderHeader();
   });
 
-  $('btnLogout').addEventListener('click', async () => {
+  $('btnLogout').addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
     try {
       await performCryptChainLogout();
-    } catch (e) {
-      console.warn('Выход из аккаунта:', e);
+    } catch (err) {
+      console.warn('Выход из аккаунта:', err);
+    } finally {
+      renderHeader();
+      renderSettingsIfOpen();
     }
   });
 
