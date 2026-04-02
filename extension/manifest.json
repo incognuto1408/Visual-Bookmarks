@@ -7,7 +7,6 @@
     "newtab": "newtab.html"
   },
   "permissions": ["storage", "identity", "bookmarks", "history", "downloads", "sessions"],
-  "optional_host_permissions": ["http://localhost/*", "http://127.0.0.1/*"],
   "host_permissions": [
     "https://www.googleapis.com/*",
     "https://*/*",

@@ -29,7 +29,18 @@ const STORAGE_KEY = 'visualBookmarks_state_v2';
 const STORAGE_KEY_LEGACY = 'visualBookmarks_state_v1';
 /** Свой фон (data URL) только локально; в основном JSON и на сервере — маркер CUSTOM_BG_MARKER */
 const STORAGE_KEY_CUSTOM_BG = 'visualBookmarks_customBg_dataUrl_v1';
+/** Кэш событий календаря: 1 ч при непустом ответе, 2 мин при пустом (чтобы не «залипать» на ошибке/токене). */
+const STORAGE_KEY_CALENDAR_CACHE = 'visualBookmarks_calendar_events_cache_v2';
+const STORAGE_KEY_CALENDAR_CACHE_LEGACY = 'visualBookmarks_calendar_events_cache_v1';
+const CALENDAR_CACHE_TTL_MS = 60 * 60 * 1000;
+const CALENDAR_EMPTY_CACHE_TTL_MS = 2 * 60 * 1000;
 const CUSTOM_BG_MARKER = '__VB_CUSTOM_BG__';
+/** Синхронное зеркало для первого кадра новой вкладки (stale-while-revalidate с chrome.storage) */
+const LOCAL_BOOT_CACHE_KEY = 'visualBookmarks_newtab_boot_v1';
+/** Data URL своего фона (если не гигантский) — мгновенно при следующем открытии */
+const LOCAL_BOOT_BG_KEY = 'visualBookmarks_newtab_boot_bg_v1';
+const MAX_BOOT_BG_STORAGE_CHARS = 2_000_000;
+const BOOT_CACHE_VERSION = 1;
 const SYNC_FILENAME = 'visual-bookmarks-sync.json';
 const SYNC_DEBOUNCE_MS = 2500;
 /** Интервал между успешными синхронизациями Crypt-Chain (мс); таймер отсчитывается от `lastServerSyncAt` */
@@ -202,6 +213,8 @@ let bmColorUserTouched = false;
 let calendarEvents = [];
 let calendarEventIndex = 0;
 let calendarRotateTimer = null;
+/** Повторный клик «Подключить календарь», пока ждём service worker / OAuth */
+let calendarConnectInFlight = false;
 
 const $ = (id) => {
   const el = document.getElementById(id);
@@ -472,6 +485,79 @@ async function loadState() {
   });
 }
 
+/**
+ * Сохраняет компактный снимок в localStorage после успешной записи в chrome.storage
+ * (без data URL фона — в payload уже маркер). Чтение синхронное при следующем открытии вкладки.
+ */
+function writeBootCacheFromPayload(payload) {
+  if (typeof localStorage === 'undefined' || !payload) return;
+  const mirror = {
+    v: BOOT_CACHE_VERSION,
+    updatedAt: payload.updatedAt,
+    driveFileId: payload.driveFileId ?? null,
+    bookmarks: payload.bookmarks,
+    settings: payload.settings,
+    user: payload.user ?? null,
+    lastServerSyncAt:
+      typeof payload.lastServerSyncAt === 'number' && payload.lastServerSyncAt > 0
+        ? payload.lastServerSyncAt
+        : null,
+  };
+  localStorage.setItem(LOCAL_BOOT_CACHE_KEY, JSON.stringify(mirror));
+}
+
+function clearBootCache() {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(LOCAL_BOOT_CACHE_KEY);
+      localStorage.removeItem(LOCAL_BOOT_BG_KEY);
+    }
+  } catch (_) {}
+}
+
+/** @returns {boolean} true если из кэша восстановили app (до async loadState) */
+function tryApplyBootCache() {
+  if (typeof localStorage === 'undefined') return false;
+  let raw;
+  try {
+    raw = localStorage.getItem(LOCAL_BOOT_CACHE_KEY);
+  } catch {
+    return false;
+  }
+  if (!raw || raw.length < 12) return false;
+  let o;
+  try {
+    o = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!o || o.v !== BOOT_CACHE_VERSION || typeof o.updatedAt !== 'number') return false;
+  if (!Array.isArray(o.bookmarks) || !o.settings || typeof o.settings !== 'object') return false;
+
+  app.settings = mergeSettings({ ...DEFAULT_SETTINGS }, o.settings);
+  app.bookmarks = o.bookmarks.map(normalizeBookmark).filter(Boolean);
+  if (!app.bookmarks.length) app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+  app.user = o.user || null;
+  app.driveFileId = o.driveFileId ?? null;
+  app.updatedAt = o.updatedAt;
+  app.lastServerSyncAt =
+    typeof o.lastServerSyncAt === 'number' && o.lastServerSyncAt > 0 ? o.lastServerSyncAt : null;
+  syncMaxBookmarksToStoredCount();
+  try {
+    const bootBg =
+      typeof localStorage !== 'undefined' ? localStorage.getItem(LOCAL_BOOT_BG_KEY) : null;
+    if (
+      bootBg &&
+      bootBg.startsWith('data:') &&
+      app.settings.background?.type === 'image' &&
+      app.settings.background.value === CUSTOM_BG_MARKER
+    ) {
+      app.settings = mergeSettings(app.settings, { background: { type: 'image', value: bootBg } });
+    }
+  } catch (_) {}
+  return true;
+}
+
 function migrateLegacy(leg) {
   const bms = (leg.bookmarks || []).map((b, i) => ({
     id: b.id || generateId(),
@@ -539,14 +625,39 @@ function saveLocal() {
   };
 
   return new Promise((resolve) => {
+    const onStored = () => {
+      resolve();
+      /** JSON.stringify зеркала и большой data URL в localStorage — вне горячего пути, иначе подвисает вся вкладка. */
+      scheduleWhenIdle(() => {
+        try {
+          writeBootCacheFromPayload(payload);
+          if (typeof localStorage !== 'undefined') {
+            if (
+              hasCustomDataUrl &&
+              typeof bg.value === 'string' &&
+              bg.value.startsWith('data:') &&
+              bg.value.length <= MAX_BOOT_BG_STORAGE_CHARS
+            ) {
+              localStorage.setItem(LOCAL_BOOT_BG_KEY, bg.value);
+            } else {
+              localStorage.removeItem(LOCAL_BOOT_BG_KEY);
+            }
+          }
+        } catch (_) {
+          try {
+            clearBootCache();
+          } catch (__) {}
+        }
+      }, 4000);
+    };
     const writeMain = () => {
       if (hasCustomDataUrl) {
         storageLocal.set(
           { [STORAGE_KEY]: payload, [STORAGE_KEY_CUSTOM_BG]: bg.value },
-          resolve
+          onStored
         );
       } else {
-        storageLocal.set({ [STORAGE_KEY]: payload }, resolve);
+        storageLocal.set({ [STORAGE_KEY]: payload }, onStored);
       }
     };
     if (hasCustomDataUrl) {
@@ -583,6 +694,7 @@ function importFromJson(text) {
 }
 
 function resetDefaults() {
+  clearBootCache();
   app.bookmarks = DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
   app.settings = { ...DEFAULT_SETTINGS };
   app.user = null;
@@ -764,10 +876,12 @@ function normalizeServerUpdatedAt(raw) {
 /**
  * Слияние с сервером Crypt-Chain.
  * @param {{ allowSeedPush?: boolean }} opts — allowSeedPush: при 204 один раз отправить локальное состояние (вход, ручная синхронизация); false для таймера, чтобы не дёргать PUT каждую минуту.
+ * @returns {Promise<boolean>} true если был полный renderAll (данные с сервера изменились)
  */
 async function pullServerMerge(opts = {}) {
   const allowSeedPush = opts.allowSeedPush !== false;
-  if (typeof VisualBookmarksApi === 'undefined') return;
+  let didFullRender = false;
+  if (typeof VisualBookmarksApi === 'undefined') return false;
   const remote = await VisualBookmarksApi.pullSyncState();
   if (remote == null) {
     if (allowSeedPush && (app.bookmarks.length || app.updatedAt)) await pushServerState();
@@ -784,28 +898,45 @@ async function pullServerMerge(opts = {}) {
     if (app.updatedAt > ru) {
       await pushServerState();
     } else {
-      if (Array.isArray(remote.bookmarks)) {
-        const mapped = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
-        app.bookmarks =
-          mapped.length > 0 ? mapped : DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+      const inSync = ruNorm > 0 && ruNorm === app.updatedAt;
+      const serverNewer = ruNorm > app.updatedAt;
+      const initialFromServer =
+        ruNorm === 0 &&
+        app.updatedAt === 0 &&
+        ((Array.isArray(remote.bookmarks) && remote.bookmarks.length > 0) ||
+          (remote.settings &&
+            typeof remote.settings === 'object' &&
+            Object.keys(remote.settings).length > 0));
+
+      if (!inSync && (serverNewer || initialFromServer)) {
+        if (Array.isArray(remote.bookmarks)) {
+          const mapped = remote.bookmarks.map(normalizeBookmark).filter(Boolean);
+          app.bookmarks =
+            mapped.length > 0 ? mapped : DEFAULT_BOOKMARKS.map((b) => ({ ...b, id: generateId() }));
+        }
+        if (remote.settings && typeof remote.settings === 'object') {
+          app.settings = mergeSettings(
+            { ...DEFAULT_SETTINGS },
+            stripEmbeddedBackgroundForExternal(remote.settings)
+          );
+        }
+        if (ruNorm > 0) {
+          app.updatedAt = ruNorm;
+        }
+        syncMaxBookmarksToStoredCount();
+        if (await enrichFaviconBackgrounds()) touchUpdated();
+        renderAll();
+        didFullRender = true;
       }
-      if (remote.settings && typeof remote.settings === 'object') {
-        app.settings = mergeSettings(
-          { ...DEFAULT_SETTINGS },
-          stripEmbeddedBackgroundForExternal(remote.settings)
-        );
-      }
-      if (ruNorm > 0) {
-        app.updatedAt = ruNorm;
-      }
-      syncMaxBookmarksToStoredCount();
-      if (await enrichFaviconBackgrounds()) touchUpdated();
-      renderAll();
     }
   }
   await hydrateCustomBackgroundIfNeeded();
+  if (!didFullRender) {
+    applyBackground();
+  }
   app.lastServerSyncAt = Date.now();
   await saveLocal();
+  return didFullRender;
 }
 
 let serverPeriodicPullTimer = null;
@@ -844,30 +975,25 @@ async function runServerPeriodicPullTick() {
   }
 }
 
-/** Планирует следующий pull через `delayUntilNextServerPullMs()` после последней успешной синхронизации */
+/** Раньше планировался периодический pull; синк только при открытии вкладки и по кнопке в настройках. */
 async function restartServerPeriodicPull() {
   stopServerPeriodicPull();
-  if (typeof VisualBookmarksApi === 'undefined') return;
-  if (!(await VisualBookmarksApi.hasToken())) return;
-  const delay = delayUntilNextServerPullMs();
-  serverPeriodicPullTimer = setTimeout(() => {
-    void runServerPeriodicPullTick();
-  }, delay);
 }
 
+/** @returns {Promise<boolean>} нужен ли полный renderAll снаружи */
 async function pullRemoteMerge() {
   try {
     if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
-      await pullServerMerge();
-      return;
+      return await pullServerMerge();
     }
   } catch (e) {
     console.warn('Server sync:', e);
   }
   try {
     const t = await getToken(false);
-    await pullDriveMerge(t);
+    return await pullDriveMerge(t);
   } catch (_) {}
+  return false;
 }
 
 /** Один проход: Crypt-Chain при активной сессии, иначе тихий push в Google Drive. Без ожидания из UI. */
@@ -877,7 +1003,6 @@ async function pushRemoteStateOnce() {
       await pushServerState();
       app.lastServerSyncAt = Date.now();
       await saveLocal();
-      void restartServerPeriodicPull();
       return;
     }
   } catch (e) {
@@ -901,11 +1026,12 @@ function debounce(fn, ms) {
   };
 }
 
+/** @returns {Promise<boolean>} был ли полный renderAll */
 async function pullDriveMerge(token) {
   const files = await driveListFile(token);
   if (!files.length) {
     if (app.bookmarks.length) await pushDrive(token);
-    return;
+    return false;
   }
   app.driveFileId = files[0].id;
   const text = await driveDownload(token, app.driveFileId);
@@ -925,7 +1051,10 @@ async function pullDriveMerge(token) {
     if (await enrichFaviconBackgrounds()) touchUpdated();
     await saveLocal();
     renderAll();
-  } else if (app.updatedAt > ru) await pushDrive(token);
+    return true;
+  }
+  if (app.updatedAt > ru) await pushDrive(token);
+  return false;
 }
 
 /**
@@ -976,12 +1105,46 @@ function startCalendarRotation() {
   }, 5000);
 }
 
-async function refreshCalendarEvents() {
-  stopCalendarRotation();
-  if (!app.settings.googleCalendarEnabled || typeof VisualBookmarksCalendar === 'undefined') {
-    calendarEvents = [];
-    calendarEventIndex = 0;
+/** Отрисовка виджета календаря после await сети — в rAF, чтобы не блокировать ввод. */
+function scheduleCalendarWidgetPaint() {
+  requestAnimationFrame(() => {
     renderCalendarWidget();
+    startCalendarRotation();
+  });
+}
+
+function calendarDayKeyForCache() {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+function clearCalendarEventsCache() {
+  return new Promise((resolve) => {
+    if (typeof storageLocal.remove === 'function') {
+      storageLocal.remove([STORAGE_KEY_CALENDAR_CACHE, STORAGE_KEY_CALENDAR_CACHE_LEGACY], () => resolve());
+    } else {
+      resolve();
+    }
+  });
+}
+
+function applyCalendarResult(events) {
+  stopCalendarRotation();
+  calendarEvents = Array.isArray(events) ? events : [];
+  calendarEventIndex = 0;
+  scheduleCalendarWidgetPaint();
+}
+
+/** Запрос календаря в контексте страницы (fallback без service worker). Кэш пишем только после успешного ответа API. */
+async function refreshCalendarEventsInPage(dayKey, pageOpts = {}) {
+  const force = !!pageOpts.force;
+  if (typeof VisualBookmarksCalendar === 'undefined') {
+    applyCalendarResult([]);
     return;
   }
   const VBC = VisualBookmarksCalendar;
@@ -996,19 +1159,25 @@ async function refreshCalendarEvents() {
       (m.includes('403') && (m.includes('insufficient') || m.includes('Insufficient')))
     );
   };
-
+  const persistAndApply = (events) =>
+    new Promise((resolve) => {
+      storageLocal.set(
+        { [STORAGE_KEY_CALENDAR_CACHE]: { at: Date.now(), dayKey, events } },
+        () => {
+          applyCalendarResult(events);
+          resolve();
+        }
+      );
+    });
   try {
     let token = await VBC.getAuthToken(false);
     if (!token) {
-      calendarEvents = [];
-      renderCalendarWidget();
+      applyCalendarResult([]);
       return;
     }
     const load = async (t) => {
-      calendarEvents = await VBC.fetchTodayEvents(t);
-      calendarEventIndex = 0;
-      renderCalendarWidget();
-      startCalendarRotation();
+      const events = await VBC.fetchTodayEvents(t);
+      await persistAndApply(Array.isArray(events) ? events : []);
     };
     try {
       await load(token);
@@ -1024,9 +1193,111 @@ async function refreshCalendarEvents() {
     }
   } catch (e) {
     console.warn('Google Calendar:', e);
-    calendarEvents = [];
-    renderCalendarWidget();
+    if (!force) {
+      const stale = await new Promise((resolve) => {
+        storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
+          resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
+        });
+      });
+      if (
+        stale &&
+        stale.dayKey === dayKey &&
+        Array.isArray(stale.events) &&
+        stale.events.length > 0
+      ) {
+        applyCalendarResult(stale.events);
+        return;
+      }
+    }
+    applyCalendarResult([]);
   }
+}
+
+/**
+ * Кэш 1 ч + тот же календарный день → без сети. Запрос выполняется в service worker, страница не блокируется.
+ * @param {{ force?: boolean }} opts — force после подключения календаря
+ */
+async function refreshCalendarEvents(opts = {}) {
+  const force = !!opts.force;
+
+  if (!app.settings.googleCalendarEnabled) {
+    stopCalendarRotation();
+    calendarEvents = [];
+    calendarEventIndex = 0;
+    await clearCalendarEventsCache();
+    scheduleCalendarWidgetPaint();
+    return;
+  }
+
+  const dayKey = calendarDayKeyForCache();
+
+  if (!force) {
+    const cached = await new Promise((resolve) => {
+      storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
+        resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
+      });
+    });
+    if (cached && typeof cached.at === 'number' && cached.dayKey === dayKey && Array.isArray(cached.events)) {
+      const effTtl = cached.events.length > 0 ? CALENDAR_CACHE_TTL_MS : CALENDAR_EMPTY_CACHE_TTL_MS;
+      if (Date.now() - cached.at < effTtl) {
+        applyCalendarResult(cached.events);
+        return;
+      }
+    }
+  }
+
+  await new Promise((r) => setTimeout(r, 0));
+
+  if (isExtensionContext() && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+    const resp = await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'VB_CALENDAR_TODAY' }, (r) => {
+          if (chrome.runtime.lastError) {
+            resolve({
+              ok: false,
+              events: [],
+              error: chrome.runtime.lastError.message,
+            });
+            return;
+          }
+          resolve(r && typeof r === 'object' ? r : { ok: false, events: [] });
+        });
+      } catch (e) {
+        resolve({ ok: false, events: [], error: String(e) });
+      }
+    });
+    if (resp.ok && Array.isArray(resp.events)) {
+      await new Promise((resolve) => {
+        storageLocal.set(
+          { [STORAGE_KEY_CALENDAR_CACHE]: { at: Date.now(), dayKey, events: resp.events } },
+          () => resolve()
+        );
+      });
+      applyCalendarResult(resp.events);
+      return;
+    }
+    console.warn('Google Calendar (фон):', resp.error || 'нет ответа');
+    if (!force) {
+      const stale = await new Promise((resolve) => {
+        storageLocal.get([STORAGE_KEY_CALENDAR_CACHE], (res) => {
+          resolve(res[STORAGE_KEY_CALENDAR_CACHE] || null);
+        });
+      });
+      if (
+        stale &&
+        stale.dayKey === dayKey &&
+        Array.isArray(stale.events) &&
+        stale.events.length > 0
+      ) {
+        applyCalendarResult(stale.events);
+        return;
+      }
+    }
+    await refreshCalendarEventsInPage(dayKey, { force });
+    return;
+  }
+
+  await refreshCalendarEventsInPage(dayKey, { force });
 }
 
 async function connectGoogleCalendar() {
@@ -1034,16 +1305,78 @@ async function connectGoogleCalendar() {
     alert('Модуль календаря не загружен (файл google-calendar.js).');
     return;
   }
-  try {
-    const token = await VisualBookmarksCalendar.getAuthToken(true);
-    if (!token) throw new Error('Токен не получен');
-    await VisualBookmarksCalendar.fetchTodayEvents(token);
+  if (calendarConnectInFlight) return;
+  calendarConnectInFlight = true;
+  const calModalBtn = document.getElementById('btnCalendarModalConnect');
+  const calSettingsBtn = document.getElementById('btnCalendarSettingsConnect');
+  [calModalBtn, calSettingsBtn].forEach((b) => {
+    if (b) {
+      b.disabled = true;
+      b.setAttribute('aria-busy', 'true');
+    }
+  });
+
+  const finishOk = async (events) => {
     app.settings.googleCalendarEnabled = true;
     hideModal('modalCalendarConnect');
+    const list = Array.isArray(events) ? events : [];
+    const dayKey = calendarDayKeyForCache();
+    /** Сначала данные в памяти и кэше: иначе persist() → renderAll() рисует виджет с пустым calendarEvents. */
+    applyCalendarResult(list);
+    await new Promise((resolve) => {
+      storageLocal.set(
+        { [STORAGE_KEY_CALENDAR_CACHE]: { at: Date.now(), dayKey, events: list } },
+        () => resolve()
+      );
+    });
+    await yieldToPaint();
     await persist();
-    await refreshCalendarEvents();
+    renderSettingsIfOpen();
+  };
+
+  try {
+    await yieldToPaint();
+    await new Promise((r) => setTimeout(r, 0));
+    if (isExtensionContext() && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+      const resp = await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: 'VB_CALENDAR_CONNECT' }, (r) => {
+            if (chrome.runtime.lastError) {
+              resolve({
+                ok: false,
+                events: [],
+                error: chrome.runtime.lastError.message,
+              });
+              return;
+            }
+            resolve(r && typeof r === 'object' ? r : { ok: false, events: [], error: 'нет ответа' });
+          });
+        } catch (e) {
+          resolve({ ok: false, events: [], error: String(e) });
+        }
+      });
+      if (resp.ok) {
+        await finishOk(resp.events);
+        return;
+      }
+      alert(resp.error || 'Не удалось подключить календарь');
+      return;
+    }
+
+    const token = await VisualBookmarksCalendar.getAuthToken(true);
+    if (!token) throw new Error('Токен не получен');
+    const events = await VisualBookmarksCalendar.fetchTodayEvents(token);
+    await finishOk(events);
   } catch (e) {
     alert((e && e.message) || String(e));
+  } finally {
+    calendarConnectInFlight = false;
+    [calModalBtn, calSettingsBtn].forEach((b) => {
+      if (b) {
+        b.disabled = false;
+        b.removeAttribute('aria-busy');
+      }
+    });
   }
 }
 
@@ -2054,17 +2387,19 @@ function wireSettingsAppearance(totalPages) {
     });
   });
   const btnCalConn = document.getElementById('btnCalendarSettingsConnect');
-  if (btnCalConn) btnCalConn.addEventListener('click', () => void connectGoogleCalendar());
+  if (btnCalConn) btnCalConn.addEventListener('click', () => showModal('modalCalendarConnect'));
   const btnCalDis = document.getElementById('btnCalendarSettingsDisconnect');
   if (btnCalDis) {
     btnCalDis.addEventListener('click', () => {
       app.settings.googleCalendarEnabled = false;
       stopCalendarRotation();
       calendarEvents = [];
-      void persist().then(() => {
-        renderSettingsIfOpen();
-        renderCalendarWidget();
-      });
+      void clearCalendarEventsCache().then(() =>
+        persist().then(() => {
+          renderSettingsIfOpen();
+          renderCalendarWidget();
+        })
+      );
     });
   }
   document.querySelectorAll('[data-engine-pick]').forEach((b) => {
@@ -2137,7 +2472,6 @@ function wireSettingsSystem() {
     try {
       await pullServerMerge({ allowSeedPush: true });
       st.textContent = 'Синхронизация выполнена, ' + new Date().toLocaleTimeString();
-      await restartServerPeriodicPull();
     } catch (e) {
       st.textContent = e.message || String(e);
     }
@@ -2434,7 +2768,25 @@ function scheduleWhenIdle(fn, timeoutMs = 2500) {
   }
 }
 
+/** Два rAF подряд — даём браузеру отрисовать кадр до тяжёлой работы (OAuth / persist). */
+function yieldToPaint() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+}
+
 async function init() {
+  let shownFromBoot = false;
+  try {
+    if (tryApplyBootCache()) {
+      shownFromBoot = true;
+      $('loader').classList.add('is-hidden');
+      renderAll();
+    }
+  } catch (_) {}
+
   let cryptSession = { hasToken: false, user: null };
   await Promise.all([
     loadState(),
@@ -2448,7 +2800,9 @@ async function init() {
     app.user = normalizeServerUser(cryptSession.user);
   }
 
-  $('loader').classList.add('is-hidden');
+  if (!shownFromBoot) {
+    $('loader').classList.add('is-hidden');
+  }
   renderAll();
 
   document.addEventListener('click', onGlobalClick);
@@ -2549,7 +2903,6 @@ async function init() {
         hideModal('modalAuth');
         await applyServerStateAfterAuth({ isRegistration: authMode === 'register' });
         renderHeader();
-        await restartServerPeriodicPull();
       } catch (err) {
         alert(err.message || String(err));
       }
@@ -2749,49 +3102,37 @@ async function init() {
     if (app.settings.theme === 'auto') renderAll();
   });
 
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible') return;
-    scheduleWhenIdle(() => {
-      if (app.settings.googleCalendarEnabled) void refreshCalendarEvents();
-    });
-    scheduleWhenIdle(() => {
-      void pullRemoteMerge()
-        .catch(() => {})
-        .finally(async () => {
-          renderAll();
-          if (typeof VisualBookmarksApi !== 'undefined' && (await VisualBookmarksApi.hasToken())) {
-            await restartServerPeriodicPull();
-          }
-        });
-    });
-  });
-
   $('btnCalendarModalConnect')?.addEventListener('click', () => void connectGoogleCalendar());
 
-  setInterval(() => {
-    if (app.settings.googleCalendarEnabled) void refreshCalendarEvents();
-  }, 60 * 1000);
+  scheduleWhenIdle(() => {
+    try {
+      if (isExtensionContext() && chrome.runtime?.sendMessage) {
+        chrome.runtime.sendMessage({ type: 'VB_CALENDAR_SW_WAKE' }, () => {
+          void chrome.runtime?.lastError;
+        });
+      }
+    } catch (_) {}
+  });
 
   scheduleWhenIdle(() => void refreshCalendarEvents());
   scheduleWhenIdle(() => {
-    void pullRemoteMerge()
-      .catch(() => {})
-      .finally(async () => {
-        renderAll();
-        await restartServerPeriodicPull();
-        scheduleWhenIdle(() => {
-          void (async () => {
-            try {
-              if (await enrichFaviconBackgrounds()) {
-                touchUpdated();
-                await saveLocal();
-                renderAll();
-                debouncedPush();
-              }
-            } catch (_) {}
-          })();
-        }, 4000);
-      });
+    void (async () => {
+      try {
+        await pullRemoteMerge();
+      } catch (_) {}
+      scheduleWhenIdle(() => {
+        void (async () => {
+          try {
+            if (await enrichFaviconBackgrounds()) {
+              touchUpdated();
+              await saveLocal();
+              renderAll();
+              debouncedPush();
+            }
+          } catch (_) {}
+        })();
+      }, 4000);
+    })();
   });
 }
 

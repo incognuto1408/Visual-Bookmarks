@@ -1,3 +1,95 @@
+try {
+  importScripts(
+    typeof chrome !== 'undefined' && chrome.runtime?.getURL
+      ? chrome.runtime.getURL('google-calendar.js')
+      : 'google-calendar.js'
+  );
+} catch (e) {
+  console.error('VisualBookmarks: google-calendar.js import failed', e);
+}
+
+/**
+ * Google Calendar в worker: не блокирует поток новой вкладки (OAuth + fetch вне страницы).
+ */
+async function fetchCalendarTodayInWorker() {
+  const VBC = typeof self !== 'undefined' ? self.VisualBookmarksCalendar : null;
+  if (!VBC || typeof VBC.getAuthToken !== 'function') {
+    return { ok: false, events: [], error: 'calendar module' };
+  }
+  const shouldRetryAuth = (err) => {
+    const st = err && err.status;
+    if (st === 401 || st === 403) return true;
+    const m = String((err && err.message) || err || '');
+    return (
+      m.includes('401') ||
+      m.includes('UNAUTHORIZED') ||
+      m.includes('Invalid Credentials') ||
+      (m.includes('403') && (m.includes('insufficient') || m.includes('Insufficient')))
+    );
+  };
+  try {
+    let token = await VBC.getAuthToken(false);
+    if (!token) return { ok: false, events: [], error: 'no token' };
+    try {
+      const events = await VBC.fetchTodayEvents(token);
+      return { ok: true, events: Array.isArray(events) ? events : [] };
+    } catch (apiErr) {
+      if (shouldRetryAuth(apiErr) && typeof VBC.removeCachedAuthToken === 'function') {
+        await VBC.removeCachedAuthToken(token);
+        token = await VBC.getAuthToken(true);
+        if (token) {
+          const events = await VBC.fetchTodayEvents(token);
+          return { ok: true, events: Array.isArray(events) ? events : [] };
+        }
+      }
+      throw apiErr;
+    }
+  } catch (e) {
+    return { ok: false, events: [], error: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * Первое подключение: интерактивный OAuth + загрузка событий в worker, без блокировки потока new tab.
+ */
+async function connectCalendarInWorker() {
+  const VBC = typeof self !== 'undefined' ? self.VisualBookmarksCalendar : null;
+  if (!VBC || typeof VBC.getAuthToken !== 'function') {
+    return { ok: false, events: [], error: 'calendar module' };
+  }
+  const shouldRetryAuth = (err) => {
+    const st = err && err.status;
+    if (st === 401 || st === 403) return true;
+    const m = String((err && err.message) || err || '');
+    return (
+      m.includes('401') ||
+      m.includes('UNAUTHORIZED') ||
+      m.includes('Invalid Credentials') ||
+      (m.includes('403') && (m.includes('insufficient') || m.includes('Insufficient')))
+    );
+  };
+  try {
+    let token = await VBC.getAuthToken(true);
+    if (!token) return { ok: false, events: [], error: 'no token' };
+    try {
+      const events = await VBC.fetchTodayEvents(token);
+      return { ok: true, events: Array.isArray(events) ? events : [] };
+    } catch (apiErr) {
+      if (shouldRetryAuth(apiErr) && typeof VBC.removeCachedAuthToken === 'function') {
+        await VBC.removeCachedAuthToken(token);
+        token = await VBC.getAuthToken(true);
+        if (token) {
+          const events = await VBC.fetchTodayEvents(token);
+          return { ok: true, events: Array.isArray(events) ? events : [] };
+        }
+      }
+      throw apiErr;
+    }
+  } catch (e) {
+    return { ok: false, events: [], error: String((e && e.message) || e) };
+  }
+}
+
 /**
  * Проверка favicon только с сайта закладки (service worker обходит CORS newtab).
  * Если ответ не похож на картинку — иконки «нет», newtab покажет fallback-earth.svg.
@@ -91,6 +183,19 @@ function faviconUrlsToTry(pageUrl) {
 chrome.runtime.onInstalled.addListener(() => {});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  /** Прогрев SW + importScripts до клика «Подключить», чтобы не копить задержку на холодном старте. */
+  if (message?.type === 'VB_CALENDAR_SW_WAKE') {
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (message?.type === 'VB_CALENDAR_TODAY') {
+    void fetchCalendarTodayInWorker().then((r) => sendResponse(r));
+    return true;
+  }
+  if (message?.type === 'VB_CALENDAR_CONNECT') {
+    void connectCalendarInWorker().then((r) => sendResponse(r));
+    return true;
+  }
   if (message?.type !== 'VB_GET_FAVICON') return false;
   (async () => {
     const urls = faviconUrlsToTry(message.pageUrl);
