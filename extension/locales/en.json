@@ -115,7 +115,7 @@
   "set.saveFile": "Save to file",
   "set.loadFile": "Load from file",
   "set.reset": "Reset",
-  "set.footerVersion": "Visual Bookmarks StabilityInternational 2.2.0",
+  "set.footerVersion": "Visual Bookmarks 2.2.0",
   "calModal.title": "Connect Google Calendar",
   "calModal.text": "Allow access to show today’s events on the new tab. Event data is not sent to third parties except Google.",
   "calModal.btn": "Connect Google Calendar",

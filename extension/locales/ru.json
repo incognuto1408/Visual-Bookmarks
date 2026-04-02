@@ -115,7 +115,7 @@
   "set.saveFile": "Сохранить в файл",
   "set.loadFile": "Загрузить из файла",
   "set.reset": "Сбросить",
-  "set.footerVersion": "Visual Bookmarks StabilityInternational 2.2.0",
+  "set.footerVersion": "Visual Bookmarks 2.2.0",
   "calModal.title": "Подключить Google Календарь",
   "calModal.text": "Дайте доступ к календарю, чтобы видеть события на сегодня на новой вкладке. Данные событий не отправляются на сторонние серверы, кроме Google.",
   "calModal.btn": "Подключить Google Календарь",

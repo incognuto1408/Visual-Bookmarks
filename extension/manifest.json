@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Visual Bookmarks StabilityInternational",
+  "name": "Visual Bookmarks",
   "version": "2.2.0",
   "description": "Визуальные закладки Stability International: сетка, фон, синхронизация с Crypt-Chain.",
   "chrome_url_overrides": {
@@ -24,6 +24,6 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_title": "Visual Bookmarks StabilityInternational"
+    "default_title": "Visual Bookmarks"
   }
 }

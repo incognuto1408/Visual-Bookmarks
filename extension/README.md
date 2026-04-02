@@ -1,4 +1,4 @@
-# Visual Bookmarks StabilityInternational — расширение Chrome
+# Visual Bookmarks — расширение Chrome
 
 Новая вкладка в стиле референса: **сетка плиток**, поиск с выбором движка, нижняя панель (закрытые вкладки, загрузки, закладки браузера, история), **настройки с вкладками** (оформление / закладки / система), смена **фона** (пресеты Unsplash, свой файл, «фон дня»), демо-панель **Stability**, вход/регистрация через **Crypt-Chain** (`https://crypt-chain.com/browser-extension/login`, фиксированный API без выбора URL пользователем), экспорт/импорт JSON, синхронизация с **Crypt-Chain** при активной сессии, опционально виджет **Google Календаря** (только чтение, отдельный OAuth scope).
 
@@ -33,7 +33,7 @@
 3. **APIs & Services → OAuth consent screen**: тип *External*, заполните название приложения, свой email, сохраните. В разделе scopes для проверки укажите `.../auth/calendar.readonly` (он прописан в `manifest.json`).
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
 5. Тип приложения: **Chrome extension**.
-6. Поле **Item ID**: скопируйте **ID расширения** со страницы `chrome://extensions` (у пункта «Visual Bookmarks StabilityInternational»). Это строка из 32 символов.
+6. Поле **Item ID**: скопируйте **ID расширения** со страницы `chrome://extensions` (у пункта «Visual Bookmarks»). Это строка из 32 символов.
 7. Создайте клиента и скопируйте **Client ID** вида `xxxx.apps.googleusercontent.com`.
 8. В файле `manifest.json` замените значение `oauth2.client_id` на ваш Client ID (вместо `REPLACE_WITH_YOUR_...`).
 9. Перезагрузите расширение на `chrome://extensions`.
